@@ -1101,3 +1101,8 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+tests/test_qwen4_rocm.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h ; $(CC) $(QUALITY_CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -D_GNU_SOURCE -I. -c -o $@ $<
+tests/test_qwen4_rocm: tests/test_qwen4_rocm.o ds4_rocm.o ds4_image.o $(ROCM_MMQ_OBJS) ; $(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+.PHONY: test-qwen4-rocm
+test-qwen4-rocm: tests/test_qwen4_rocm ; ./tests/test_qwen4_rocm

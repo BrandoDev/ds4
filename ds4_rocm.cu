@@ -167,6 +167,8 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 
 #include "rocm/ds4_rocm_glm.cuh"
 
+#include "rocm/ds4_rocm_qwen4.cuh"
+
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
