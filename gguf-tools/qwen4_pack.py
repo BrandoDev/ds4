@@ -1425,7 +1425,10 @@ def encode_fallback_experts(values: np.ndarray, qtype: str,
                 source_values, ((0, 0), (0, padding)), mode='constant'
             )
             weights = np.pad(weights, (0, padding), mode='constant')
-        return quantizer.encode(expert_values, qtype, weights)
+        try:
+            return quantizer.encode(expert_values, qtype, weights)
+        except Exception as exc:
+            raise ValueError(f'{source_name} expert {expert}: {exc}') from exc
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         blocks = list(pool.map(convert, range(values.shape[0])))
