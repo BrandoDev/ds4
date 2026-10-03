@@ -87,3 +87,8 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+/tests/test_glm53_kda_rocm
+/tests/test_prompt_prefix
+/tests/test_qwen4_rocm
+/tests/test_qwen4_rocm_idx
+/tests/test_qwen4_rocm_iq3

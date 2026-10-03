@@ -3538,6 +3538,30 @@ int main(void) {
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
 
+#ifdef DS4_ROCM_BUILD
+    if (getenv("DS4_TEST_QWEN4_ROCM_PREFILL")) {
+        test_moe_mm_tiles_iq2(&arena);
+        printf("Qwen ROCm IQ2/Q2 prefill expert parity passed\n");
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN4_ROCM_CORE")) {
+        /* Stage-by-stage CPU/GPU parity for the ROCm Qwen main path. */
+        test_hc(&arena, 64, 8, 2, 0u);
+        test_gdn(&arena, 2, 6, 32, 7);
+        test_ple(&arena, 64, 12);
+        test_router(&arena, 32, 10, 5);
+        test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+        test_moe_types(&arena, 2, 2, 2560, 640, 1, 16u, 10u);
+        test_moe_types(&arena, 2, 2, 2560, 640, 9, 16u, 10u);
+        /* The public Q2 GGUF keeps Q4_K/MXFP4 experts in its MTP layer. */
+        test_moe_types(&arena, 2, 2, 2560, 640, 1, 12u, 39u);
+        test_dense_mm(&arena, 256, 128, 1, 8u);
+        test_mtp(&arena, 64, 4);
+        printf("Qwen ROCm staged core parity passed\n");
+        return 0;
+    }
+#endif
+
 #ifndef __APPLE__
     if (getenv("DS4_TEST_QWEN4_ATTN_GROUPS")) { test_attn_groups(); return 0; }
     if (getenv("DS4_TEST_QWEN4_DENSE_ONLY")) {

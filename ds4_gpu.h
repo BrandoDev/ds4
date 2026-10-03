@@ -3474,6 +3474,17 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+/* IQ3_XXS row dot. The activation has logical_k floats; encoded rows use
+ * physical_k values. The padded tail is treated as exact zero on device. */
+int ds4_gpu_qwen4_iq3_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t rows, uint32_t logical_k, uint32_t physical_k);
+#ifdef DS4_ROCM_BUILD
+/* Synchronize and release demand-mapped model weights after a Qwen layer. */
+int ds4_gpu_qwen4_release_layer_weights(void);
+void ds4_gpu_qwen4_use_device_weight_copies(void);
+#endif
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,

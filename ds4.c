@@ -50,7 +50,7 @@
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_DEEPSEEK41_GPU 1
 #endif
-#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+#if !defined(DS4_NO_GPU)
 #define DS4_HAS_QWEN4_GPU 1
 #ifdef __APPLE__
 #define DS4_HAS_QWEN4_METAL 1
@@ -1179,6 +1179,10 @@ static const uint8_t ksigns_iq2xs[128] = {
      80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
      96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+static const uint32_t iq3xxs_grid[256] = {
+#include "ds4_iq3xxs_grid.inc"
 };
 
 static const uint64_t iq2xxs_grid[256] = {
@@ -2365,6 +2369,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ3_XXS  = 18,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
@@ -3531,6 +3536,12 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
+#ifdef DS4_ROCM_BUILD
+    /* Qwen's routed tables exceed a 16 GiB card. Leave them in the mapped
+     * GGUF and let cuda_model_range_ptr register individual ranges on first
+     * use; eager whole-model caching would fail before a token can run. */
+    if (ds4_model_is_qwen4()) return true;
+#endif
 #ifndef DS4_ROCM_BUILD
     if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
         return true;
@@ -4338,6 +4349,42 @@ static inline float ds4_vec_dot_q5_q6_K_f32(uint32_t type, int n, const uint8_t 
     return 0.0f;
 }
 
+/* The encoded row may be 768 wide, but Qwen's activation remains 640 wide.
+ * Guard the logical bound before touching x so callers may pass a 640-element
+ * buffer with a nonzero sentinel immediately after it. */
+static float ds4_vec_dot_iq3_xxs_f32(int physical, int logical,
+                                      const uint8_t *row, const float *x) {
+    if (physical <= 0 || physical % 256 || logical <= 0 || logical > physical)
+        ds4_die("invalid IQ3_XXS logical/physical width");
+    float sum = 0.0f;
+    for (int block = 0; block < physical / 256; block++) {
+        const uint8_t *p = row + (size_t)block * 98;
+        uint16_t dh;
+        memcpy(&dh, p, 2);
+        const float d = f16_to_f32(dh);
+        const uint8_t *qs = p + 2;
+        for (int group = 0; group < 8; group++) {
+            uint32_t aux;
+            memcpy(&aux, p + 66 + group * 4, 4);
+            const float scale = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+            for (int pair = 0; pair < 4; pair++) {
+                const uint8_t signs = ksigns_iq2xs[(aux >> (pair * 7)) & 127u];
+                const uint32_t g0 = iq3xxs_grid[qs[group * 8 + pair * 2]];
+                const uint32_t g1 = iq3xxs_grid[qs[group * 8 + pair * 2 + 1]];
+                const uint32_t base = (uint32_t)block * 256u + (uint32_t)group * 32u + (uint32_t)pair * 8u;
+                for (uint32_t j = 0; j < 8; j++) {
+                    const uint32_t k = base + j;
+                    if (k >= (uint32_t)logical) break;
+                    const uint32_t grid = j < 4 ? g0 : g1;
+                    const int v = (int)((grid >> ((j & 3u) * 8u)) & 0xffu);
+                    sum += scale * (float)((signs & (1u << j)) ? -v : v) * x[k];
+                }
+            }
+        }
+    }
+    return sum;
+}
+
 static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float *y) {
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
 
@@ -4989,6 +5036,7 @@ static void tensor_expect_f16_or_q8_0_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ3_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
@@ -5000,6 +5048,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ3_XXS: return 98;
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
@@ -5605,9 +5654,10 @@ static void weights_validate_qwen4_layout(
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
+        /* Padded Q2_K/IQ3_XXS down rows store 640 logical inputs in three 256-value blocks.
          * Activations remain 640 wide; only the weight row stride is padded. */
-        const uint32_t down_width = l->ffn_down_exps->type == DS4_TENSOR_Q2_K ?
+        const uint32_t down_width = (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+                                     l->ffn_down_exps->type == DS4_TENSOR_IQ3_XXS) ?
             (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
         tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -57662,8 +57712,14 @@ typedef struct ds4_qwen4_gpu_graph {
 } ds4_qwen4_gpu_graph;
 
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
+#ifdef DS4_ROCM_BUILD
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 ||
+                 t->type == DS4_TENSOR_F32 || t->type == DS4_TENSOR_BF16 ||
+                 t->type == DS4_TENSOR_Q4_K);
+#else
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
                  t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+#endif
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -57673,17 +57729,28 @@ static bool qwen4_expert_type_has_mm(uint32_t type) {
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
+#ifdef DS4_ROCM_BUILD
+    /* Q2 uses IQ2_XXS/Q2_K in trunk layers; its MTP layer uses Q4_K/MXFP4.
+     * IQ3_XXS down rows store a padded 768-wide row while retaining Qwen's
+     * logical 640-wide activation. */
+    return t && (t->type == DS4_TENSOR_IQ2_XXS || t->type == DS4_TENSOR_Q2_K ||
+                 t->type == DS4_TENSOR_IQ3_XXS || t->type == DS4_TENSOR_Q4_K ||
+                 t->type == DS4_TENSOR_MXFP4) &&
+           (t->dim[0] % 256u == 0u ||
+            ((t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_MXFP4) && t->dim[0] == 640u));
+#else
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0));
+#endif
 }
 
-/* The Metal graph runs a subset of what the loader accepts. */
+/* The GPU graph runs a subset of what the loader accepts. */
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
-        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported dense weight type\n");
         return false;
     }
     if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
@@ -57736,9 +57803,32 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
+                    "(ROCm: iq2_xxs/q2_K/iq3_xxs/q4_K/mxfp4; CUDA/Metal: q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
             return false;
         }
+#ifdef DS4_ROCM_BUILD
+        if (l->ffn_gate_exps->type != l->ffn_up_exps->type ||
+            l->ffn_gate_shexp->type != l->ffn_up_shexp->type) {
+            fprintf(stderr, "ds4: Qwen ROCm gate/up expert types must match (layer %u)\n", il);
+            return false;
+        }
+        if (l->ffn_down_exps->type != DS4_TENSOR_Q2_K &&
+            l->ffn_down_exps->type != DS4_TENSOR_IQ3_XXS &&
+            l->ffn_down_exps->type != DS4_TENSOR_MXFP4) {
+            fprintf(stderr, "ds4: Qwen ROCm down experts need Q2_K, IQ3_XXS, or MXFP4 (layer %u)\n", il);
+            return false;
+        }
+        const ds4_tensor *shared[3] = {
+            l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp
+        };
+        for (int i = 0; i < 3; i++) {
+            if (shared[i]->type != DS4_TENSOR_F32 && shared[i]->type != DS4_TENSOR_F16 &&
+                shared[i]->type != DS4_TENSOR_Q8_0) {
+                fprintf(stderr, "ds4: Qwen ROCm shared expert needs F32/F16/Q8_0 (layer %u)\n", il);
+                return false;
+            }
+        }
+#endif
     }
     return true;
 }
@@ -57891,6 +57981,9 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
+#ifdef DS4_ROCM_BUILD
+    ds4_gpu_qwen4_use_device_weight_copies();
+#endif
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
     const uint64_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc, T = cap_tokens;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -58815,7 +58908,20 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
         if (ok && g->dump_prompt_rows) qwen4_graph_dump_last_ffn(g, il, T);
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
+        /* DS4_QWEN4_FT_HIDDEN writes the CPU stream after each layer. This
+         * optional GPU dump has the same [T][hc*embd] layout, so a first
+         * divergent layer can be found without guessing from final logits. */
+        if (ok && metal_graph_debug_wants("qwen_layer_stream", il, pos0))
+            metal_graph_debug_dump_tensor("qwen_layer_stream", g->R,
+                                          (uint64_t)T * hc_dim, il, pos0);
         QWEN4_PROF(5);
+#ifdef DS4_ROCM_BUILD
+        /* A Q2 layer can exceed available VRAM if demand-copied weights are
+         * retained across the whole model. Synchronize before releasing its
+         * mapped/cached ranges; all activations and state remain on device. */
+        if (ok) ok = ds4_gpu_qwen4_release_layer_weights() &&
+                     glm_graph_begin_commands_if_needed();
+#endif
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
@@ -67126,6 +67232,25 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
+    case DS4_TENSOR_IQ3_XXS: {
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * (n / 256u) * 98u;
+        for (uint64_t k = 0; k < n; k++) {
+            const uint8_t *block = p + (k / 256u) * 98u;
+            const uint32_t within = (uint32_t)(k % 256u);
+            const uint32_t group = within / 32u, pair = (within % 32u) / 8u;
+            const uint32_t lane = within % 8u;
+            uint16_t dh;
+            uint32_t aux;
+            memcpy(&dh, block, 2);
+            memcpy(&aux, block + 66u + group * 4u, 4);
+            const uint8_t signs = ksigns_iq2xs[(aux >> (pair * 7u)) & 127u];
+            const uint32_t grid = iq3xxs_grid[block[2u + group * 8u + pair * 2u + lane / 4u]];
+            const int v = (int)((grid >> ((lane % 4u) * 8u)) & 0xffu);
+            const float scale = f16_to_f32(dh) * (0.5f + (float)(aux >> 28)) * 0.5f;
+            out[k] = scale * (float)((signs & (1u << lane)) ? -v : v);
+        }
+        break;
+    }
     default:
         ds4_die("qwen4 reference: unsupported tensor type");
     }
@@ -67135,6 +67260,16 @@ static void qwen4_ref_matvec_rows(
         const ds4_model *m, const ds4_tensor *w, uint64_t row0, uint64_t n_rows,
         const float *x, float *out) {
     const uint64_t n = w->dim[0];
+    if (w->type == DS4_TENSOR_IQ3_XXS) {
+        const uint64_t logical = n == 768u && w->ndim == 3 && w->dim[1] == DS4_N_EMBD ?
+            DS4_N_FF_EXP : n;
+        const uint8_t *base = tensor_data(m, w);
+        const uint64_t row_bytes = n / 256u * 98u;
+        for (uint64_t r = 0; r < n_rows; r++)
+            out[r] = ds4_vec_dot_iq3_xxs_f32((int)n, (int)logical,
+                                               base + (row0 + r) * row_bytes, x);
+        return;
+    }
     float *row = xmalloc(n * sizeof(float));
     for (uint64_t r = 0; r < n_rows; r++) {
         qwen4_ref_row(m, w, row0 + r, row);
@@ -70820,8 +70955,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 0;
         }
         if (opt->first_token_test) {
-            if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) {
-                fprintf(stderr, "ds4: Qwen3.8 first-token test needs CPU, Metal or CUDA\n");
+            if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_METAL &&
+                e->backend != DS4_BACKEND_CUDA) {
+                fprintf(stderr, "ds4: Qwen3.8 first-token test needs CPU, Metal or CUDA/ROCm\n");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -70833,7 +70969,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 if (ready && getenv("DS4_QWEN4_GPU")) {
                     /* Use the normal file-backed CUDA cache, not per-tensor
                      * copies from pageable mmap during the first forward. */
+#ifndef DS4_ROCM_BUILD
                     (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+#endif
                     ready = accelerator_cache_model_tensors(e->backend,
                                                              &e->model,
                                                              NULL, NULL, 0);
@@ -71658,7 +71796,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+#ifdef DS4_ROCM_BUILD
+        if (!ds4_model_is_qwen4())
+#endif
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -71684,7 +71825,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+#ifdef DS4_ROCM_BUILD
+            if (!ds4_model_is_qwen4())
+#endif
+                (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
         if (e->vision_ready) {
 #if defined(__APPLE__)
@@ -72872,7 +73016,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (ds4_model_is_qwen4()) {
         if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
             e->distributed.role != DS4_DISTRIBUTED_NONE) {
-            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal or CUDA\n");
+            fprintf(stderr, "ds4: Qwen3.8 sessions require single-host Metal or CUDA/ROCm\n");
             free(s);
             return 1;
         }

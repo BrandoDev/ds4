@@ -1555,3 +1555,486 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(
         n_v_head,
         head_dim);
 }
+
+
+/* Qwen3.8 indexer - ROCm correctness path. */
+
+__global__ static void qwen4_rocm_idx_score_kernel(
+        float *out,
+        const float *q,
+        const __half *key,
+        uint32_t N,
+        uint32_t H,
+        uint32_t D,
+        uint32_t pos0,
+        uint32_t ratio) {
+    const uint32_t b =
+        blockIdx.x * 4u + threadIdx.x / 32u;
+
+    const uint32_t t = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+
+    if (b >= N) return;
+
+    float score = 0.0f;
+
+    if (b >= (pos0 + t + 1u) / ratio) {
+        score = -3.0e38f;
+    } else {
+        for (uint32_t h = 0; h < H; ++h) {
+            float acc = 0.0f;
+
+            for (uint32_t i = lane; i < D; i += 32u) {
+                acc +=
+                    q[((uint64_t)t * H + h) * D + i] *
+                    __half2float(
+                        key[(uint64_t)b * D + i]);
+            }
+
+            acc = warp_sum_f32(acc);
+
+            if (lane == 0u) {
+                score += fmaxf(acc, 0.0f);
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        out[(uint64_t)t * N + b] = score;
+    }
+}
+
+__global__ static void qwen4_rocm_idx_tile_max_kernel(
+        uint32_t *out,
+        const float *scores,
+        uint32_t N,
+        uint32_t n_tiles) {
+    const uint32_t tile =
+        blockIdx.x * blockDim.x + threadIdx.x;
+
+    const uint32_t t = blockIdx.y;
+
+    if (tile >= n_tiles) return;
+
+    uint32_t best = 0u;
+
+    const uint32_t begin = tile * 8u;
+    const uint32_t end =
+        min(N, begin + 8u);
+
+    for (uint32_t i = begin; i < end; ++i) {
+        const float v =
+            fmaxf(scores[(uint64_t)t * N + i], 0.0f);
+
+        best = max(best, __float_as_uint(v));
+    }
+
+    out[(uint64_t)t * n_tiles + tile] = best;
+}
+
+__global__ static void qwen4_rocm_idx_expand_kernel(
+        int32_t *out,
+        uint32_t *count,
+        const int32_t *blocks,
+        uint32_t K,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t stride) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t pos = pos0 + t;
+
+    const uint32_t tail =
+        ((pos + 1u) / ratio) * ratio;
+
+    for (uint32_t i = threadIdx.x;
+         i < K * ratio;
+         i += blockDim.x) {
+        out[(uint64_t)t * stride + i] =
+            blocks[(uint64_t)t * K + i / ratio] *
+                (int32_t)ratio +
+            (int32_t)(i % ratio);
+    }
+
+    for (uint32_t i = tail + threadIdx.x;
+         i <= pos;
+         i += blockDim.x) {
+        out[
+            (uint64_t)t * stride +
+            K * ratio +
+            i - tail
+        ] = (int32_t)i;
+    }
+
+    if (threadIdx.x == 0u) {
+        count[t] =
+            K * ratio +
+            pos + 1u - tail;
+    }
+}
+
+extern "C" int ds4_gpu_qwen4_idx_score_tensor(
+        ds4_gpu_tensor *score,
+        ds4_gpu_tensor *tile_max,
+        const ds4_gpu_tensor *iq,
+        const ds4_gpu_tensor *block_key,
+        uint32_t n_tokens,
+        uint32_t n_blocks,
+        uint32_t n_idx_head,
+        uint32_t idx_dim,
+        uint32_t pos0,
+        uint32_t ratio) {
+    if (!score || !iq || !block_key ||
+        !n_tokens || !n_blocks ||
+        !n_idx_head || !idx_dim || !ratio) {
+        return 0;
+    }
+
+    const uint64_t score_bytes =
+        (uint64_t)n_tokens *
+        n_blocks *
+        sizeof(float);
+
+    const uint64_t q_bytes =
+        (uint64_t)n_tokens *
+        n_idx_head *
+        idx_dim *
+        sizeof(float);
+
+    const uint64_t key_bytes =
+        (uint64_t)n_blocks *
+        idx_dim *
+        sizeof(__half);
+
+    if (score->bytes < score_bytes ||
+        iq->bytes < q_bytes ||
+        block_key->bytes < key_bytes) {
+        return 0;
+    }
+
+    qwen4_rocm_idx_score_kernel<<<
+        dim3((n_blocks + 3u) / 4u, n_tokens),
+        128
+    >>>(
+        (float *)score->ptr,
+        (const float *)iq->ptr,
+        (const __half *)block_key->ptr,
+        n_blocks,
+        n_idx_head,
+        idx_dim,
+        pos0,
+        ratio);
+
+    if (!cuda_ok(
+            cudaGetLastError(),
+            "Qwen ROCm index score")) {
+        return 0;
+    }
+
+    if (tile_max) {
+        const uint32_t n_tiles =
+            (n_blocks + 7u) / 8u;
+
+        if (tile_max->bytes <
+            (uint64_t)n_tokens *
+            n_tiles *
+            sizeof(uint32_t)) {
+            return 0;
+        }
+
+        qwen4_rocm_idx_tile_max_kernel<<<
+            dim3((n_tiles + 255u) / 256u, n_tokens),
+            256
+        >>>(
+            (uint32_t *)tile_max->ptr,
+            (const float *)score->ptr,
+            n_blocks,
+            n_tiles);
+
+        if (!cuda_ok(
+                cudaGetLastError(),
+                "Qwen ROCm index tile max")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+extern "C" int ds4_gpu_qwen4_idx_select_tensor(
+        ds4_gpu_tensor *sel,
+        const ds4_gpu_tensor *score,
+        const ds4_gpu_tensor *tile_max,
+        uint32_t n_blocks,
+        uint32_t n_tokens,
+        uint32_t top_k) {
+    (void)tile_max;
+
+    return ds4_gpu_indexer_topk_tensor(
+        sel,
+        score,
+        n_blocks,
+        n_tokens,
+        top_k);
+}
+
+extern "C" int ds4_gpu_qwen4_idx_expand_tensor(
+        ds4_gpu_tensor *sel_tokens,
+        ds4_gpu_tensor *n_sel,
+        const ds4_gpu_tensor *sel_blocks,
+        uint32_t n_tokens,
+        uint32_t n_sel_blocks,
+        uint32_t ratio,
+        uint32_t pos0,
+        uint32_t sel_stride) {
+    if (!sel_tokens || !n_sel || !sel_blocks ||
+        !n_tokens || !n_sel_blocks ||
+        !ratio ||
+        (uint64_t)n_sel_blocks * ratio +
+            ratio - 1u > sel_stride) {
+        return 0;
+    }
+
+    if (sel_tokens->bytes <
+            (uint64_t)n_tokens *
+            sel_stride *
+            sizeof(int32_t) ||
+        n_sel->bytes <
+            (uint64_t)n_tokens *
+            sizeof(uint32_t) ||
+        sel_blocks->bytes <
+            (uint64_t)n_tokens *
+            n_sel_blocks *
+            sizeof(int32_t)) {
+        return 0;
+    }
+
+    qwen4_rocm_idx_expand_kernel<<<
+        n_tokens,
+        256
+    >>>(
+        (int32_t *)sel_tokens->ptr,
+        (uint32_t *)n_sel->ptr,
+        (const int32_t *)sel_blocks->ptr,
+        n_sel_blocks,
+        ratio,
+        pos0,
+        sel_stride);
+
+    return cuda_ok(
+        cudaGetLastError(),
+        "Qwen ROCm index expand");
+}
+
+
+/* Qwen3.8 block-key - ROCm correctness path. */
+
+typedef struct {
+    float freq[32];
+    float scale;
+    uint32_t custom;
+} qwen4_rocm_rope_args;
+
+static float qwen4_rocm_rope_freq[32] = {};
+static float qwen4_rocm_rope_scale = 1.0f;
+static bool qwen4_rocm_rope_custom = false;
+
+extern "C" void ds4_gpu_qwen4_set_rope(
+        const float *freq,
+        uint32_t n_pairs,
+        float mscale) {
+    qwen4_rocm_rope_custom = freq != NULL;
+    qwen4_rocm_rope_scale = freq ? mscale : 1.0f;
+
+    for (uint32_t i = 0; i < 32u; ++i) {
+        qwen4_rocm_rope_freq[i] =
+            freq && i < n_pairs ? freq[i] : 0.0f;
+    }
+}
+
+__global__ static void qwen4_rocm_idx_block_key_kernel(
+        __half *out,
+        const float *ik,
+        const uint32_t *pos3,
+        const float *gamma,
+        uint32_t block0,
+        uint32_t ratio,
+        uint32_t D,
+        uint32_t n_rot,
+        float rope_base,
+        float eps,
+        qwen4_rocm_rope_args rp) {
+    const uint32_t b = block0 + blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t npt = D / 32u;
+
+    __shared__ float row[128];
+
+    float v[4] = {0, 0, 0, 0};
+    float ss = 0.0f;
+
+    for (uint32_t i = 0; i < npt; ++i) {
+        const uint32_t d = lane * npt + i;
+
+        float acc = 0.0f;
+
+        for (uint32_t t = 0; t < ratio; ++t) {
+            acc += ik[
+                ((uint64_t)b * ratio + t) * D + d
+            ];
+        }
+
+        v[i] = acc / (float)ratio;
+        ss += v[i] * v[i];
+    }
+
+    /* warp_sum_f32 leaves the complete reduction in lane 0 only. Every
+     * lane normalizes its own four dimensions, so broadcast the sum. */
+    ss = qwen4_rocm_wave32_sum_xor(ss);
+
+    const float inv =
+        rsqrtf(ss / (float)D + eps);
+
+    for (uint32_t i = 0; i < npt; ++i) {
+        const uint32_t d = lane * npt + i;
+
+        row[d] =
+            v[i] *
+            inv *
+            gamma[d];
+    }
+
+    __syncthreads();
+
+    if (lane < n_rot / 2u) {
+        const uint32_t *pos =
+            pos3 + (uint64_t)b * ratio * 4u;
+
+        const float freq =
+            rp.custom
+                ? rp.freq[lane]
+                : powf(
+                    rope_base,
+                    -2.0f * (float)lane /
+                    (float)n_rot);
+
+        const float theta =
+            (float)pos[lane % 3u] * freq;
+
+        const float c =
+            cosf(theta) * rp.scale;
+
+        const float sn =
+            sinf(theta) * rp.scale;
+
+        const float a = row[lane];
+        const float bb =
+            row[lane + n_rot / 2u];
+
+        row[lane] =
+            a * c - bb * sn;
+
+        row[lane + n_rot / 2u] =
+            a * sn + bb * c;
+    }
+
+    __syncthreads();
+
+    for (uint32_t d = lane;
+         d < D;
+         d += 32u) {
+        out[(uint64_t)b * D + d] =
+            __float2half_rn(row[d]);
+    }
+}
+
+extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(
+        ds4_gpu_tensor *block_key,
+        const ds4_gpu_tensor *ik_cache,
+        const ds4_gpu_tensor *pos3,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t g_ik_offset,
+        uint32_t block0,
+        uint32_t n_blocks,
+        uint32_t ratio,
+        uint32_t idx_dim,
+        uint32_t n_rot,
+        float rope_base,
+        float eps) {
+    if (!block_key || !ik_cache ||
+        !pos3 || !model_map ||
+        !n_blocks || !ratio ||
+        idx_dim < 32u ||
+        idx_dim > 128u ||
+        (idx_dim % 32u) != 0u ||
+        n_rot > idx_dim ||
+        n_rot > 64u ||
+        (n_rot & 1u)) {
+        return 0;
+    }
+
+    const uint64_t rows =
+        (uint64_t)block0 + n_blocks;
+
+    const uint64_t out_bytes =
+        rows *
+        idx_dim *
+        sizeof(__half);
+
+    const uint64_t ik_bytes =
+        rows *
+        ratio *
+        idx_dim *
+        sizeof(float);
+
+    const uint64_t pos_bytes =
+        rows *
+        ratio *
+        4u *
+        sizeof(uint32_t);
+
+    if (block_key->bytes < out_bytes ||
+        ik_cache->bytes < ik_bytes ||
+        pos3->bytes < pos_bytes) {
+        return 0;
+    }
+
+    const float *gamma =
+        (const float *)cuda_model_range_ptr(
+            model_map,
+            g_ik_offset,
+            (uint64_t)idx_dim * sizeof(float),
+            "Qwen index block-key gamma");
+
+    if (!gamma) return 0;
+
+    qwen4_rocm_rope_args rp = {};
+    rp.scale = qwen4_rocm_rope_scale;
+    rp.custom =
+        qwen4_rocm_rope_custom ? 1u : 0u;
+
+    for (uint32_t i = 0; i < 32u; ++i) {
+        rp.freq[i] =
+            qwen4_rocm_rope_freq[i];
+    }
+
+    qwen4_rocm_idx_block_key_kernel<<<
+        n_blocks,
+        32
+    >>>(
+        (__half *)block_key->ptr,
+        (const float *)ik_cache->ptr,
+        (const uint32_t *)pos3->ptr,
+        gamma,
+        block0,
+        ratio,
+        idx_dim,
+        n_rot,
+        rope_base,
+        eps,
+        rp);
+
+    return cuda_ok(
+        cudaGetLastError(),
+        "Qwen ROCm index block-key");
+}
