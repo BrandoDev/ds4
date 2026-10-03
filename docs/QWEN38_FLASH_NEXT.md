@@ -156,7 +156,11 @@ dense weights, Q8_0/MXFP4/Q4_0/Q4_K/Q2_K/IQ2_XXS experts, F16/F32/Q8_0
 hyper-connection mixers and the original BF16 n-gram table.
 Tensor parallelism, pipeline execution and SSD expert streaming are not
 implemented for this model yet.
-ROCm is not supported. CPU code is a correctness reference, not a general
+ROCm supports the text graph and IQ3_XXS routed experts, with short-prompt
+CPU/GPU parity and generation validated on the RX 9070 XT. Weights are copied
+to VRAM per layer; vision and SSD selected-expert caching remain unsupported.
+See [ROCm validation and limits](QWEN38_ROCM_RDNA4.md). IQ3_XXS is not supported
+by the Metal/CUDA graphs. CPU code is a correctness reference, not a general
 inference backend.
 
 
