@@ -372,6 +372,75 @@ Run the host-only positive and negative controls:
 python3 -m unittest discover -s gguf-tools/quality-testing/tests -v
 ```
 
+## ARC-Challenge on Qwen3.8
+
+`run_arc_challenge.py` uses the existing Qwen logit diagnostic to score
+complete answer choices with one model load. It follows EleutherAI's zero-shot
+ARC prompt (`Question: ...\nAnswer:`), adds one space before the answer text,
+and reports `acc` and `acc_norm` (log likelihood divided by the answer's
+Unicode character count). It does not apply a chat template or generate CoT.
+See the [ARC task](https://github.com/EleutherAI/lm-evaluation-harness/tree/main/lm_eval/tasks/arc)
+and [metric implementation](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/api/task.py).
+
+Supply the original 1172-row `ARC-Challenge-Test.jsonl` from the
+[AllenAI ARC dataset](https://huggingface.co/datasets/allenai/ai2_arc).
+The sample is shuffled with a fixed seed, retained in full, and shared by
+shorter pilots and subsequent runs. Start with:
+
+```sh
+python3 gguf-tools/quality-testing/run_arc_challenge.py \
+  --dataset gguf/benchmarks/arc-challenge/ARC-Challenge-Test.jsonl \
+  --model gguf/Qwen3.8-Flash-Next-Q2.gguf --backend rocm \
+  --output gguf/benchmarks/arc-challenge/q2-teacher-pilot-20 \
+  --sample-size 300 --max-cases 20 --seed 42
+```
+
+Extend that successful pilot without repeating its questions:
+
+```sh
+python3 gguf-tools/quality-testing/run_arc_challenge.py \
+  --dataset gguf/benchmarks/arc-challenge/ARC-Challenge-Test.jsonl \
+  --model gguf/Qwen3.8-Flash-Next-Q2.gguf --backend rocm \
+  --output gguf/benchmarks/arc-challenge/q2-teacher-300 \
+  --sample-size 300 --max-cases 300 --seed 42 \
+  --resume-from gguf/benchmarks/arc-challenge/q2-teacher-pilot-20
+```
+
+Each run records the dataset, sample, binary and runner hashes, model size,
+mtime and first-8-MiB hash, token inputs, per-case
+scores and Wilson 95% accuracy intervals. Raw logits are scored and deleted
+as soon as each sequence completes. A continuation is accepted only when its
+tokens preserve the context boundary. The default scores choices token by
+token. `--scoring all-rows` is an experimental shortcut with a first-candidate
+teacher-forcing check; a Q2 extension run exceeded its 0.03 token-logprob
+tolerance (0.031282), so it was rejected and teacher forcing remains the
+benchmark reference. Run summaries distinguish partial,
+completed and successful runs. Compare Q2 and IQ3 on the same selected IDs and
+protocol; a sampled zero-shot result is not a full few-shot leaderboard score.
+
+For the public Q2, add
+`--expected-model-sha256 b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9`
+to verify the entire GGUF before and after inference and record both full hashes. This is
+recommended: an October 4 run encountered a damaged HC tensor with NaN weights
+and unreadable Btrfs blocks far beyond the first 8 MiB. A repaired model needs a
+fresh benchmark; do not extend scores collected from the damaged file.
+Postflight hashing is recorded separately from inference timing. A run is
+successful only if both checks pass.
+
+ROCm teacher forcing snapshots the recurrent state and reuses an identical
+question prefix across its choices. It still feeds every answer token through
+the reference single-token path. `DS4_QWEN4_FT_NO_PREFIX_CACHE=1` disables this
+reuse for diagnostic comparisons. Inference stages only the union of routed
+experts used by each batch; `DS4_QWEN4_FULL_EXPERT_COPIES=1` retains the original
+whole-table transfer for diagnostic comparisons. Neither switch changes the
+benchmark scoring protocol.
+
+Host-only scoring, boundary and sampling checks:
+
+```sh
+python3 -m unittest discover -s gguf-tools/quality-testing/tests -p test_arc_challenge.py
+```
+
 ## 7. Qwen3.8 Spark Baseline
 
 Measured on 2026-09-15, using one DGX Spark per quant. The short set has 100

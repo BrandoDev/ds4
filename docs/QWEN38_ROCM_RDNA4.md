@@ -13,9 +13,10 @@ through the GPU graph. There is no CPU routed-expert fallback in that graph.
 hides `/dev/kfd` and `/dev/dri`; the commands were run with host device
 access. The DS4 Q2 GGUF is `gguf/Qwen3.8-Flash-Next-Q2.gguf`, 137.10 GiB on
 disk. Its 95.37 GiB BF16 n-gram table stays on disk, while its 41.73 GiB
-main/MTP tensor set exceeds the card's 16 GiB VRAM. The graph copies model
-weight ranges to device memory for each layer, synchronizes, then releases
-them. Host mapping of the file-backed weights failed with HIP's `Memobj map
+main/MTP tensor set exceeds the card's 16 GiB VRAM. The graph copies dense
+weights and the union of selected routed experts for each layer, synchronizes,
+then releases the layer's ranges. Expert staging reuses device scratch.
+Host mapping of the file-backed weights failed with HIP's `Memobj map
 does not have ptr` error on this host. The existing `--ssd-streaming`
 selected-expert cache is not connected to the graph; leave it off.
 
@@ -220,3 +221,54 @@ threads and explicit IQ3 grid initialization. The high-thread-count
 converter instability remains unresolved. Vision encoding on ROCm remains
 unsupported. The current results cover short text prompts and MTP; they do
 not establish long-context stability or throughput on cold SSD data.
+
+## October 4: ARC integrity investigation and transfer optimizations
+
+The Q2 teacher-forced ARC run stopped at question 272 after 271 completed
+questions. A fresh process reproduced NaN logits. Layer tracing located the
+first failure at layer 46's FFN hyper-connection: its F16 up matrix contained
+six NaNs, with 256 values differing from both the original BF16 source
+converted to F16 and the independently stored IQ3 dense tensor. An HTTP range
+read of the original public Q2 agreed exactly with those references. The
+damaged tensor was backed up and restored. A full-file read also encountered
+Btrfs checksum failures in the n-gram region; those unreadable blocks were
+restored from the original file. The repaired Q2's complete SHA-256 is
+`b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9`,
+matching the published file. Its entire main/MTP prefix was compared against
+the original and its n-gram rows against all 128 original BF16 source shards.
+The old ARC scores are retained for diagnosis
+and marked invalid for model-quality reporting. The cause of corruption has
+not been established.
+
+ROCm now stages only the union of experts selected by the batch, in ascending
+expert ID order, and remaps IDs into the compact tables. A single token uses
+10 of 512 experts: routed transfer volume is 10/512 of the former volume.
+Adjacent expert spans share a copy, mid/down reuse the existing temporary
+buffer, and the dot products retain their original accumulation order.
+Already mapped or resident model ranges retain their existing path.
+`DS4_QWEN4_FULL_EXPERT_COPIES=1` selects the old transfers for diagnostics.
+
+The ROCm `DS4_QWEN4_FT_LIST` diagnostic also snapshots the question's GDN and
+PLE histories, n-gram context, and position. Consecutive choices with identical
+prefix token IDs restore that snapshot and reuse the first logit row. KV and
+index rows below the prefix remain intact; rows beyond it are invisible until
+overwritten. Every continuation token still uses the same single-token
+teacher-forcing path. The snapshot storage is allocated through the existing
+verifier graph allocation; no predictor steps run.
+`DS4_QWEN4_FT_NO_PREFIX_CACHE=1` disables reuse for diagnostics. CUDA and Metal
+diagnostics retain their previous behavior.
+
+| Local comparison | Reference | Optimized | Ratio | Logits |
+| --- | ---: | ---: | ---: | --- |
+| Q2 selected transfers, 12 ARC choices | 113.201 s | 49.873 s | 2.27x | bitwise identical |
+| IQ3 prefix reuse, 12 ARC choices including a 177-token prefix | 114.489 s | 33.148 s | 3.45x | bitwise identical |
+
+These are separate comparisons on different question sets; their ratios
+must not be multiplied. Q2 timings were collected during the integrity
+investigation and establish transfer parity, not a validated accuracy score.
+The final ROCm build, IQ3/Q2 expert tests, staged HC/GDN/PLE/router/MoE/MTP
+tests, and indexer tests pass. Expert tests now exercise non-contiguous IDs,
+multi-token unions, the shared expert, and explicitly reject nonfinite output.
+The host ARC suite has 37 passing tests, including corruption beyond the
+first 8 MiB. The runner accepts `--expected-model-sha256` to verify the entire
+model before and after inference and record both hashes in the run provenance.
