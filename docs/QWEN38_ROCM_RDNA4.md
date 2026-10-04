@@ -14,8 +14,9 @@ hides `/dev/kfd` and `/dev/dri`; the commands were run with host device
 access. The DS4 Q2 GGUF is `gguf/Qwen3.8-Flash-Next-Q2.gguf`, 137.10 GiB on
 disk. Its 95.37 GiB BF16 n-gram table stays on disk, while its 41.73 GiB
 main/MTP tensor set exceeds the card's 16 GiB VRAM. The graph copies dense
-weights and the union of selected routed experts for each layer, synchronizes,
-then releases the layer's ranges. Expert staging reuses device scratch.
+weights and selected routed experts for row-kernel batches, synchronizes,
+then releases the layer's ranges. Expert staging reuses device scratch;
+the grouped Q2 prefill path retains whole-table transfers.
 Host mapping of the file-backed weights failed with HIP's `Memobj map
 does not have ptr` error on this host. The existing `--ssd-streaming`
 selected-expert cache is not connected to the graph; leave it off.
@@ -240,12 +241,14 @@ The old ARC scores are retained for diagnosis
 and marked invalid for model-quality reporting. The cause of corruption has
 not been established.
 
-ROCm now stages only the union of experts selected by the batch, in ascending
+ROCm's expert row kernels now stage only the union selected by the batch, in ascending
 expert ID order, and remaps IDs into the compact tables. A single token uses
 10 of 512 experts: routed transfer volume is 10/512 of the former volume.
 Adjacent expert spans share a copy, mid/down reuse the existing temporary
 buffer, and the dot products retain their original accumulation order.
 Already mapped or resident model ranges retain their existing path.
+Q2 grouped prefill still stages the whole tables; IQ3 uses the row kernels
+for prefill as well as decode.
 `DS4_QWEN4_FULL_EXPERT_COPIES=1` selects the old transfers for diagnostics.
 
 The ROCm `DS4_QWEN4_FT_LIST` diagnostic also snapshots the question's GDN and
@@ -262,10 +265,16 @@ diagnostics retain their previous behavior.
 | --- | ---: | ---: | ---: | --- |
 | Q2 selected transfers, 12 ARC choices | 113.201 s | 49.873 s | 2.27x | bitwise identical |
 | IQ3 prefix reuse, 12 ARC choices including a 177-token prefix | 114.489 s | 33.148 s | 3.45x | bitwise identical |
+| Q2 first 20 ARC questions, both optimizations | 545.852 s | 195.831 s | 2.79x | identical choice log-likelihoods and predictions |
 
 These are separate comparisons on different question sets; their ratios
 must not be multiplied. Q2 timings were collected during the integrity
 investigation and establish transfer parity, not a validated accuracy score.
+The first-20-question comparison uses the repaired, fully checksum-verified
+Q2 and the same IDs as the earlier teacher-forced pilot. Both score 13/20
+for acc and acc_norm. The new 300-question run is independent of the old
+partial run and continues in `gguf/benchmarks/arc-challenge/q2-verified-fast-300`;
+its postflight hash check is required before reporting success.
 The final ROCm build, IQ3/Q2 expert tests, staged HC/GDN/PLE/router/MoE/MTP
 tests, and indexer tests pass. Expert tests now exercise non-contiguous IDs,
 multi-token unions, the shared expert, and explicitly reject nonfinite output.

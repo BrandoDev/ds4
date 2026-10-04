@@ -430,8 +430,9 @@ successful only if both checks pass.
 ROCm teacher forcing snapshots the recurrent state and reuses an identical
 question prefix across its choices. It still feeds every answer token through
 the reference single-token path. `DS4_QWEN4_FT_NO_PREFIX_CACHE=1` disables this
-reuse for diagnostic comparisons. Inference stages only the union of routed
-experts used by each batch; `DS4_QWEN4_FULL_EXPERT_COPIES=1` retains the original
+reuse for diagnostic comparisons. Expert row kernels stage only the union of
+routed experts used by their batch; grouped Q2 prefill retains full transfers.
+`DS4_QWEN4_FULL_EXPERT_COPIES=1` retains the original
 whole-table transfer for diagnostic comparisons. Neither switch changes the
 benchmark scoring protocol.
 
