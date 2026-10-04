@@ -3546,13 +3546,14 @@ int main(void) {
     }
     if (getenv("DS4_TEST_QWEN4_ROCM_CORE")) {
         /* Stage-by-stage CPU/GPU parity for the ROCm Qwen main path. */
+        ds4_gpu_qwen4_use_device_weight_copies();
         test_hc(&arena, 64, 8, 2, 0u);
         test_gdn(&arena, 2, 6, 32, 7);
         test_ple(&arena, 64, 12);
         test_router(&arena, 32, 10, 5);
         test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
-        test_moe_types(&arena, 2, 2, 2560, 640, 1, 16u, 10u);
-        test_moe_types(&arena, 2, 2, 2560, 640, 9, 16u, 10u);
+        test_moe_types(&arena, 8, 3, 2560, 640, 1, 16u, 10u);
+        test_moe_types(&arena, 8, 3, 2560, 640, 9, 16u, 10u);
         /* The public Q2 GGUF keeps Q4_K/MXFP4 experts in its MTP layer. */
         test_moe_types(&arena, 2, 2, 2560, 640, 1, 12u, 39u);
         test_dense_mm(&arena, 256, 128, 1, 8u);

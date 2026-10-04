@@ -10,6 +10,68 @@ static uint64_t qwen4_rocm_expert_row_bytes(uint32_t type, uint32_t K) {
     return qwen4_rocm_row_bytes(type, K);
 }
 
+/* Stage the union of routed experts, keeping their rows byte-identical.
+ * Reading IDs waits for the router (and the preceding projection); the
+ * default-stream copy orders reuse of the shared temporary buffer after its
+ * previous kernel. Mid and down therefore need no persistent weight cache. */
+static int qwen4_rocm_selected_weights(
+        const ds4_gpu_tensor *sel, const void *map, uint64_t off, uint64_t up_off,
+        uint32_t NE, uint32_t T, uint32_t NS, uint64_t expert_bytes, bool pair,
+        const char **weights, const char **up, const int **remap) {
+    *remap = NULL;
+    /* Already mapped/resident weights need no host-to-device staging. */
+    if (NE > 512u || g_model_range_mapping_supported || cuda_model_image_range_ptr(map, off, NE * expert_bytes) ||
+        getenv("DS4_QWEN4_FULL_EXPERT_COPIES")) {
+        *weights = cuda_model_range_ptr(map, off, NE * expert_bytes, "Qwen expert reference");
+        if (pair) *up = cuda_model_range_ptr(map, up_off, NE * expert_bytes, "Qwen expert up reference");
+        return *weights && (!pair || *up);
+    }
+    int indices[512];
+    for (uint32_t e = 0; e < NE; e++) indices[e] = -1;
+    const size_t n_ids = (size_t)T * NS;
+    int *ids = (int *)malloc(n_ids * sizeof(int));
+    if (!ids) return 0;
+    if (!cuda_ok(cudaMemcpy(ids, sel->ptr, n_ids * sizeof(int),
+                            cudaMemcpyDeviceToHost), "Qwen selected expert IDs")) {
+        free(ids);
+        return 0;
+    }
+    for (size_t i = 0; i < n_ids; i++) {
+        const int id = ids[i];
+        if (id < 0 || (uint32_t)id >= NE) { free(ids); return 0; }
+        indices[id] = 0;
+    }
+    free(ids);
+    uint32_t count = 0;
+    for (uint32_t e = 0; e < NE; e++) if (indices[e] == 0) indices[e] = (int)count++;
+    const uint64_t bytes = count * expert_bytes;
+    const uint64_t indices_offset = (bytes * (pair ? 2u : 1u) + 3u) & ~3ull;
+    /* Even a fully populated union fits exactly where the old full tables
+     * fit; no assumptions about token count or routing distribution. */
+    char *packed = (char *)cuda_tmp_alloc(indices_offset + NE * sizeof(int),
+                                         "Qwen selected expert weights");
+    if (!packed) return 0;
+    for (uint32_t e = 0; e < NE;) {
+        if (indices[e] < 0) { e++; continue; }
+        const uint32_t begin = e;
+        while (e < NE && indices[e] >= 0) e++;
+        const uint64_t n = (e - begin) * expert_bytes;
+        char *dst = packed + (uint64_t)indices[begin] * expert_bytes;
+        if (!cuda_ok(cudaMemcpy(dst, (const char *)map + off + begin * expert_bytes,
+                                n, cudaMemcpyHostToDevice), "Qwen selected expert weights")) return 0;
+        if (pair && !cuda_ok(cudaMemcpy(dst + bytes,
+                (const char *)map + up_off + begin * expert_bytes,
+                n, cudaMemcpyHostToDevice), "Qwen selected expert up weights")) return 0;
+    }
+    int *device_indices = (int *)(packed + indices_offset);
+    if (!cuda_ok(cudaMemcpy(device_indices, indices, NE * sizeof(int),
+                            cudaMemcpyHostToDevice), "Qwen compact expert indices")) return 0;
+    *weights = packed;
+    if (pair) *up = packed + bytes;
+    *remap = device_indices;
+    return 1;
+}
+
 __device__ static float qwen4_rocm_expert_dot(
         const char *row, const float *x, uint32_t type, uint32_t K) {
     if (type == 18u) return qwen4_rocm_iq3_dot((const uint8_t *)row, x, K, ((K + 255u) / 256u) * 256u);
@@ -81,7 +143,7 @@ __device__ static float qwen4_rocm_expert_dot(
 }
 
 __global__ static void qwen4_rocm_moe_mid_kernel(
-        float *mid, const float *x, const int *sel,
+        float *mid, const float *x, const int *sel, const int *remap,
         const char *gate, const char *up, const char *sh_gate, const char *sh_up,
         uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
         uint32_t NS, uint32_t K, uint32_t M, uint64_t rb, uint64_t srb) {
@@ -99,8 +161,9 @@ __global__ static void qwen4_rocm_moe_mid_kernel(
     } else {
         const int expert = sel[(uint64_t)t * NS + slot];
         if (expert < 0 || (uint32_t)expert >= NE) return;
-        wg = gate + ((uint64_t)expert * M + row) * rb;
-        wu = up + ((uint64_t)expert * M + row) * rb;
+        const uint32_t packed = remap ? (uint32_t)remap[expert] : (uint32_t)expert;
+        wg = gate + ((uint64_t)packed * M + row) * rb;
+        wu = up + ((uint64_t)packed * M + row) * rb;
         wt = type;
     }
     const float *xt = x + (uint64_t)t * K;
@@ -110,7 +173,7 @@ __global__ static void qwen4_rocm_moe_mid_kernel(
 }
 
 __global__ static void qwen4_rocm_moe_down_kernel(
-        float *part, const float *mid, const int *sel,
+        float *part, const float *mid, const int *sel, const int *remap,
         const char *down, const char *sh_down, uint32_t type,
         uint32_t shared_type, uint32_t NE, uint32_t NS, uint32_t K,
         uint32_t M, uint64_t rb, uint64_t srb) {
@@ -127,7 +190,8 @@ __global__ static void qwen4_rocm_moe_down_kernel(
     } else {
         const int expert = sel[(uint64_t)t * NS + slot];
         if (expert < 0 || (uint32_t)expert >= NE) return;
-        w = down + ((uint64_t)expert * M + row) * rb;
+        const uint32_t packed = remap ? (uint32_t)remap[expert] : (uint32_t)expert;
+        w = down + ((uint64_t)packed * M + row) * rb;
         wt = type;
     }
     const float *x = mid + ((uint64_t)t * stride + slot) * K;
@@ -149,13 +213,15 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(
         sel->bytes < (uint64_t)T * NS * 4u ||
         go > size || bytes > size - go || uo > size || bytes > size - uo ||
         (st != UINT32_MAX && (sgo > size || sb > size - sgo || suo > size || sb > size - suo))) return 0;
-    const char *g = cuda_model_range_ptr(map, go, bytes, "Qwen expert gate");
-    const char *u = cuda_model_range_ptr(map, uo, bytes, "Qwen expert up");
+    const char *g = NULL, *u = NULL;
+    const int *remap = NULL;
+    if (!qwen4_rocm_selected_weights(sel, map, go, uo, NE, T, NS, M * rb, true,
+                                     &g, &u, &remap)) return 0;
     const char *sg = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, sgo, sb, "Qwen shared gate");
     const char *su = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, suo, sb, "Qwen shared up");
     if (!g || !u || (st != UINT32_MAX && (!sg || !su))) return 0;
     qwen4_rocm_moe_mid_kernel<<<dim3((M + 63u) / 64u, stride, T), 64>>>(
-        (float *)mid->ptr, (const float *)x->ptr, (const int *)sel->ptr,
+        (float *)mid->ptr, (const float *)x->ptr, (const int *)sel->ptr, remap,
         g, u, sg, su, type, st, NE, T, NS, K, M, rb, srb);
     return cuda_ok(cudaGetLastError(), "Qwen MoE mid");
 }
@@ -175,11 +241,14 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(
         sel->bytes < (uint64_t)T * NS * 4u ||
         off > size || bytes > size - off ||
         (st != UINT32_MAX && (so > size || sb > size - so))) return 0;
-    const char *w = cuda_model_range_ptr(map, off, bytes, "Qwen expert down");
+    const char *w = NULL;
+    const int *remap = NULL;
+    if (!qwen4_rocm_selected_weights(sel, map, off, 0u, NE, T, NS, M * rb, false,
+                                     &w, NULL, &remap)) return 0;
     const char *sw = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, so, sb, "Qwen shared down");
     if (!w || (st != UINT32_MAX && !sw)) return 0;
     qwen4_rocm_moe_down_kernel<<<dim3((M + 63u) / 64u, stride, T), 64>>>(
-        (float *)part->ptr, (const float *)mid->ptr, (const int *)sel->ptr,
+        (float *)part->ptr, (const float *)mid->ptr, (const int *)sel->ptr, remap,
         w, sw, type, st, NE, NS, K, M, rb, srb);
     return cuda_ok(cudaGetLastError(), "Qwen MoE down");
 }

@@ -67859,7 +67859,14 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0)) {
+#ifdef DS4_ROCM_BUILD
+        const bool cache_prefix = getenv("DS4_QWEN4_FT_NO_PREFIX_CACHE") == NULL;
+#else
+        const bool cache_prefix = false;
+#endif
+        /* The verifier's snapshot buffers also hold a teacher-forcing
+         * prefix. Predictor steps are never run in this diagnostic. */
+        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, cache_prefix, NULL, NULL, NULL, 0)) {
             free(g);
             fclose(lf);
             return 1;
@@ -67874,13 +67881,15 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         char *line = xmalloc(65536);
         int *lseq = xmalloc(4096 * sizeof(int));
         float *out = xmalloc((size_t)4096 * DS4_N_VOCAB * sizeof(float));
+        int prefix[4096];
+        uint32_t prefix_len = 0;
+        float *prefix_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         while (fgets(line, 65536, lf)) {
             char *tab = strchr(line, '\t');
             if (!tab) continue;
             *tab = '\0';
             char *out_path = tab + 1;
             out_path[strcspn(out_path, "\r\n")] = '\0';
-            qwen4_graph_reset(g);
             /* "<prompt ids>|<target ids>": prefill the prompt in chunks
              * (the production path), then teacher-force the targets one at a
              * time; out receives one [vocab] row per target position. */
@@ -67893,7 +67902,19 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             }
             if (p_len == 0 || ln == 0) continue;
             bool fok = true;
-            for (uint32_t p = 0; p < p_len && fok;) {
+            const bool reuse = cache_prefix && bar && prefix_len == p_len &&
+                               memcmp(prefix, lseq, p_len * sizeof(int)) == 0;
+            if (reuse) {
+                /* Only positions beyond the saved prefix were written by
+                 * another choice. Restoring recurrence and position makes
+                 * those KV/index rows invisible until they are overwritten. */
+                fok = qwen4_graph_state_copy(g, false);
+                memcpy(out, prefix_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            } else {
+                prefix_len = 0;
+                qwen4_graph_reset(g);
+            }
+            for (uint32_t p = 0; !reuse && p < p_len && fok;) {
                 const uint32_t n = p_len - p < g->cap_tokens ? p_len - p : g->cap_tokens;
                 float *dst = bar ? (p + n == p_len ? out : NULL) :
                                    out + (uint64_t)p * DS4_N_VOCAB;
@@ -67903,13 +67924,21 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
                                    p, n, g->pos, g->cap_tokens, g->n_logit_rows);
                 p += n;
             }
+            if (fok && cache_prefix && bar && !reuse) {
+                fok = qwen4_graph_state_copy(g, true);
+                if (fok) {
+                    memcpy(prefix, lseq, p_len * sizeof(int));
+                    memcpy(prefix_logits, out, (size_t)DS4_N_VOCAB * sizeof(float));
+                    prefix_len = p_len;
+                }
+            }
             for (uint32_t t = 0; bar && t + 1u < ln && fok; t++) {
                 fok = qwen4_graph_forward_tokens(g, model, weights, lseq + p_len + t, 1u,
                                                  out + (uint64_t)(t + 1u) * DS4_N_VOCAB, false);
             }
             if (!fok) {
                 fprintf(stderr, "ds4: FT_LIST forward failed (%u tokens)\n", ln);
-                free(out); free(lseq); free(line);
+                free(prefix_logits); free(out); free(lseq); free(line);
                 qwen4_graph_free(g); free(g); fclose(lf);
                 return 1;
             }
@@ -67917,7 +67946,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             if (!of || fwrite(out, sizeof(float), (size_t)ln * DS4_N_VOCAB, of) != (size_t)ln * DS4_N_VOCAB) {
                 fprintf(stderr, "ds4: FT_LIST write failed: %s\n", out_path);
                 if (of) fclose(of);
-                free(out); free(lseq); free(line);
+                free(prefix_logits); free(out); free(lseq); free(line);
                 qwen4_graph_free(g); free(g); fclose(lf);
                 return 1;
             }
@@ -67925,7 +67954,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             printf("ft_list %u tokens -> %s\n", ln, out_path);
             fflush(stdout);
         }
-        free(out); free(lseq); free(line);
+        free(prefix_logits); free(out); free(lseq); free(line);
         qwen4_graph_free(g); free(g); fclose(lf);
         return 0;
 #else

@@ -82,6 +82,7 @@ static int run_case(uint32_t logical, uint32_t physical) {
     double max_abs = 0.0, mean_abs = 0.0, max_rel = 0.0;
     for (uint32_t r = 0; r < ROWS; r++) {
         const float want = reference(weights + r * rb, x, logical, physical);
+        if (!isfinite(y[r]) || !isfinite(want)) return 0;
         const double abs_err = fabs((double)y[r] - want);
         const double rel_err = abs_err / fmax(fabs(want), 1e-3);
         if (abs_err > max_abs) max_abs = abs_err;
@@ -96,7 +97,7 @@ static int run_case(uint32_t logical, uint32_t physical) {
 }
 
 static int run_expert_forward(void) {
-    enum { NE = 2, NS = 2, K = 2560, F = 640, D = 16 };
+    enum { NE = 7, NS = 2, K = 2560, F = 640, D = 16 };
     const size_t gate_rb = K / 256u * 98u, down_rb = 3u * 98u;
     const size_t gate_bytes = NE * F * gate_rb, down_bytes = NE * D * down_rb;
     const size_t go = 0, uo = gate_bytes, dno = gate_bytes * 2u;
@@ -109,7 +110,7 @@ static int run_expert_forward(void) {
     fill_iq3_rows(model + uo, NE * F, K);
     fill_iq3_rows(model + dno, NE * D, 768u);
     for (uint32_t i = 0; i < K; i++) x[i] = (float)((int)(next_u32() % 2001u) - 1000) / 10000.0f;
-    const int selected[NS] = { 1, 0 };
+    const int selected[NS] = { 5, 1 };
     ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(K * 4u);
     ds4_gpu_tensor *ds = ds4_gpu_tensor_alloc(NS * 4u);
     ds4_gpu_tensor *dm = ds4_gpu_tensor_alloc(NS * F * 4u);
@@ -138,6 +139,7 @@ static int run_expert_forward(void) {
     for (uint32_t s = 0; s < NS; s++) for (uint32_t r = 0; r < D; r++) {
         const float want = reference(model + dno + ((size_t)selected[s] * D + r) * down_rb,
                                      mid_ref + (size_t)s * F, F, 768u);
+        if (!isfinite(got[s * D + r]) || !isfinite(want)) return 0;
         const double err = fabs((double)got[s * D + r] - want);
         const double rel = err / fmax(fabs(want), 1e-3);
         if (err > max_abs) max_abs = err;
@@ -175,7 +177,7 @@ static float reference_q2(const uint8_t *row, const float *x, uint32_t logical) 
 }
 
 static int run_q2_baseline(void) {
-    enum { NE = 2, NS = 2, K = 2560, F = 640, D = 16 };
+    enum { NE = 11, NS = 2, K = 2560, F = 640, D = 16 };
     const size_t grb = K / 256u * 84u, drb = 3u * 84u;
     const size_t gb = NE * F * grb, db = NE * D * drb;
     uint8_t *model = malloc(gb * 2u + db);
@@ -186,7 +188,7 @@ static int run_q2_baseline(void) {
     fill_q2_rows(model + gb, NE * F, K);
     fill_q2_rows(model + gb * 2u, NE * D, 768u);
     for (uint32_t i = 0; i < K; i++) x[i] = (float)((int)(next_u32() % 2001u) - 1000) / 1000.0f;
-    const int selected[NS] = { 1, 0 };
+    const int selected[NS] = { 9, 3 };
     ds4_gpu_tensor *dx = ds4_gpu_tensor_alloc(K * 4u);
     ds4_gpu_tensor *ds = ds4_gpu_tensor_alloc(NS * 4u);
     ds4_gpu_tensor *dm = ds4_gpu_tensor_alloc(NS * F * 4u);
@@ -213,6 +215,7 @@ static int run_q2_baseline(void) {
     for (uint32_t s = 0; s < NS; s++) for (uint32_t r = 0; r < D; r++) {
         const float want = reference_q2(model + gb * 2u + ((size_t)selected[s] * D + r) * drb,
                                         mid + (size_t)s * F, F);
+        if (!isfinite(got[s * D + r]) || !isfinite(want)) return 0;
         const double err = fabs((double)got[s * D + r] - want);
         const double rel = err / fmax(fabs(want), 1e-3);
         if (err > max_abs) max_abs = err;
@@ -229,6 +232,7 @@ static int run_q2_baseline(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) { fprintf(stderr, "ROCm GPU unavailable\n"); return 2; }
+    ds4_gpu_qwen4_use_device_weight_copies();
     const int ok = run_q2_baseline() && run_case(2560u, 2560u) &&
                    run_case(640u, 768u) && run_expert_forward();
     ds4_gpu_cleanup();
