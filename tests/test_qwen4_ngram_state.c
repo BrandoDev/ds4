@@ -147,8 +147,8 @@ static void check_arena_resize(ds4_engine *engine, const ds4_tokens *prompt) {
 /* A failed disk lookup must invalidate the recurrent frontier, including
  * speculative snapshots. Retrying must rebuild from the retained tokens. */
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s QWEN_GGUF\n", argv[0]);
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: %s QWEN_GGUF [hybrid]\n", argv[0]);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -160,6 +160,17 @@ int main(int argc, char **argv) {
 #endif
         .glm_mtp = true, .prefill_chunk = 32,
         .share_session_prefill_workspace = true, .placement_session_count_hint = 4};
+#ifdef DS4_ROCM_BUILD
+    if (argc == 3) {
+        assert(!strcmp(argv[2], "hybrid"));
+        opt.gpu_memory_budget_bytes = 14ULL * 1024 * 1024 * 1024;
+        /* Leave room for simultaneous sessions and arena growth; this test
+         * exercises state recovery, not maximum expert residency. */
+        opt.gpu_expert_layers = 1;
+        opt.gpu_expert_layers_set = true;
+        opt.n_threads = 16;
+    }
+#endif
     assert(ds4_engine_open(&engine, &opt) == 0);
     assert(ds4_engine_is_qwen4(engine) && engine->model.ngram_tensor);
     ds4_tokens prompt = {0};

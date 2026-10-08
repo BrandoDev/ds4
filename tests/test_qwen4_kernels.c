@@ -1088,6 +1088,9 @@ static void test_router(arena_t *a, uint32_t NE, uint32_t k, uint32_t T) {
     const uint64_t gate_off = arena_f32(a, E, &gate_w, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * E, 1.0f);
     float *logits = rand_vec((uint64_t)T * NE, 3.0f);
+    /* Equal maxima in different lanes exercise the stable smallest-ID tie
+     * break as well as the random logits in the remaining token rows. */
+    if (NE >= 32u) logits[0] = logits[7] = logits[31] = 4.0f;
     ds4_gpu_tensor *gl = upload(logits, (uint64_t)T * NE);
     ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
     ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * k * 4);
@@ -3549,14 +3552,22 @@ int main(void) {
         ds4_gpu_qwen4_use_device_weight_copies();
         test_hc(&arena, 64, 8, 2, 0u);
         test_gdn(&arena, 2, 6, 32, 7);
+        test_gdn(&arena, 2, 6, 128, 17);
         test_ple(&arena, 64, 12);
         test_router(&arena, 32, 10, 5);
+        test_router(&arena, 512, 10, 3);
         test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+        test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
         test_moe_types(&arena, 8, 3, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 3, 2560, 640, 9, 16u, 10u);
         /* The public Q2 GGUF keeps Q4_K/MXFP4 experts in its MTP layer. */
         test_moe_types(&arena, 2, 2, 2560, 640, 1, 12u, 39u);
         test_dense_mm(&arena, 256, 128, 1, 8u);
+        test_dense_mm(&arena, 7, 257, 1, 1u);
+        test_dense_mm(&arena, 256, 256, 2, 1u);
+        test_dense_mm(&arena, 64, 257, 3, 1u);
+        test_dense_mm(&arena, 33, 512, 8, 1u);
+        test_dense_mm(&arena, 320, 257, 3, 1u);
         test_mtp(&arena, 64, 4);
         printf("Qwen ROCm staged core parity passed\n");
         return 0;

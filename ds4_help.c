@@ -176,6 +176,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER) {
+        opt(fp, c, "--cpu-experts", "Qwen ROCm: compute routed experts on CPU; keep dense operations on GPU and n-grams on SSD.");
+        opt(fp, c, "--gpu-memory-budget GiB", "Qwen ROCm: retain dense/MTP weights and fit GPU expert layers within total device usage (e.g. 12GB).");
+        opt(fp, c, "--gpu-expert-layers N", "Qwen ROCm: maximum GPU trunk expert prefix (0 = CPU trunk); default budget 12 GiB.");
+    }
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {

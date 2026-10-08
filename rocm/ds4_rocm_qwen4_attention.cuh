@@ -122,6 +122,40 @@ __global__ static void qwen4_rocm_attn_decode_kernel(
         out[off + d] = (denom > 0.0f ? acc[d] / denom : 0.0f) * qwen4_rocm_sigmoid(gate[off + d]);
 }
 
+/* One wave owns a head. Keys and values are read in adjacent lanes instead
+ * of one thread maintaining a spilled 256-element accumulator. Token order,
+ * causal filtering and the online softmax recurrence stay unchanged. */
+__global__ static void qwen4_rocm_attn_wave_kernel(
+        float *out, const float *q, const float *gate, const __half *kc,
+        const __half *vc, const int *sel, const uint32_t *counts,
+        uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0,
+        bool sparse, uint32_t stride, float scale) {
+    const uint32_t lane = threadIdx.x, h = blockIdx.x, t = blockIdx.y;
+    const uint32_t kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1u;
+    const uint64_t off = ((uint64_t)t * H + h) * D;
+    float acc[8] = {}, query[8] = {};
+    for (uint32_t i = 0; lane + i * 32u < D; i++) query[i] = q[off + lane + i * 32u] * scale;
+    float mx = -3e38f, denom = 0.0f;
+    for (uint32_t j = 0; j < n; j++) {
+        const uint32_t p = sparse ? (uint32_t)sel[(uint64_t)t * stride + j] : j;
+        if (p > pos0 + t) continue;
+        const uint64_t base = ((uint64_t)p * Hkv + kh) * D;
+        float score = 0.0f;
+        for (uint32_t i = 0; lane + i * 32u < D; i++)
+            score += query[i] * __half2float(kc[base + lane + i * 32u]);
+        score = qwen4_rocm_wave32_sum_xor(score);
+        const float nm = fmaxf(mx, score), correction = expf(mx - nm), w = expf(score - nm);
+        denom = denom * correction + w;
+        for (uint32_t i = 0; lane + i * 32u < D; i++)
+            acc[i] = acc[i] * correction + w * __half2float(vc[base + lane + i * 32u]);
+        mx = nm;
+    }
+    for (uint32_t i = 0; lane + i * 32u < D; i++) {
+        const uint64_t d = off + lane + i * 32u;
+        out[d] = (denom > 0.0f ? acc[i] / denom : 0.0f) * qwen4_rocm_sigmoid(gate[d]);
+    }
+}
+
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
@@ -136,7 +170,13 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(
         vc->bytes < (uint64_t)(pos0 + T) * Hkv * D * 2u ||
         (sparse && (!sel || !counts || sel->bytes < (uint64_t)T * stride * 4u ||
                     counts->bytes < (uint64_t)T * 4u))) return 0;
-    qwen4_rocm_attn_decode_kernel<<<dim3(H, T), 1>>>(
+    if (getenv("DS4_QWEN4_SERIAL_ATTN")) {
+        qwen4_rocm_attn_decode_kernel<<<dim3(H, T), 1>>>(
+            (float *)out->ptr, (const float *)q->ptr, (const float *)gate->ptr,
+            (const __half *)kc->ptr, (const __half *)vc->ptr,
+            sparse ? (const int *)sel->ptr : NULL, sparse ? (const uint32_t *)counts->ptr : NULL,
+            H, Hkv, D, pos0, sparse, stride, scale);
+    } else qwen4_rocm_attn_wave_kernel<<<dim3(H, T), 32>>>(
         (float *)out->ptr, (const float *)q->ptr, (const float *)gate->ptr,
         (const __half *)kc->ptr, (const __half *)vc->ptr,
         sparse ? (const int *)sel->ptr : NULL, sparse ? (const uint32_t *)counts->ptr : NULL,

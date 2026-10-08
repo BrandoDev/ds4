@@ -3484,6 +3484,14 @@ int ds4_gpu_qwen4_iq3_rows_tensor(
 /* Synchronize and release demand-mapped model weights after a Qwen layer. */
 int ds4_gpu_qwen4_release_layer_weights(void);
 void ds4_gpu_qwen4_use_device_weight_copies(void);
+int ds4_gpu_qwen4_set_memory_budget(uint64_t bytes);
+uint64_t ds4_gpu_qwen4_resident_available(void);
+void *ds4_gpu_qwen4_host_alloc(uint64_t bytes);
+void ds4_gpu_qwen4_host_free(void *ptr);
+int ds4_gpu_qwen4_expert_readback(const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+                                void *host_x, void *host_ids, uint64_t x_bytes, uint64_t ids_bytes);
+int ds4_gpu_qwen4_expert_upload(ds4_gpu_tensor *out, const void *host, uint64_t bytes);
+int ds4_gpu_qwen4_cache_resident(const void *map, uint64_t size, uint64_t offset, uint64_t bytes);
 #endif
 int ds4_gpu_qwen4_moe_mid_grouped_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,

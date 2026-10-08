@@ -62,17 +62,15 @@ __device__ static inline float qwen4_rocm_wave32_sum_xor(float v) {
     return v;
 }
 
-__global__ static void qwen4_rocm_q8_small_batch_kernel(
+__device__ static void qwen4_rocm_q8_small_row(
         float *out,
         const unsigned char *w,
         const float *x,
         uint32_t T,
         uint32_t K,
         uint32_t M,
-        uint64_t row_bytes) {
+        uint64_t row_bytes, uint32_t row) {
     const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t wave = threadIdx.x >> 5u;
-    const uint32_t row = blockIdx.x * 4u + wave;
 
     if (row >= M) return;
 
@@ -115,6 +113,53 @@ __global__ static void qwen4_rocm_q8_small_batch_kernel(
         if (lane == 0u) {
             out[(uint64_t)t * M + row] = sum;
         }
+    }
+}
+
+__global__ static void qwen4_rocm_q8_small_batch_kernel(
+        float *out, const unsigned char *w, const float *x,
+        uint32_t T, uint32_t K, uint32_t M, uint64_t row_bytes) {
+    qwen4_rocm_q8_small_row(out, w, x, T, K, M, row_bytes,
+                           blockIdx.x * 4u + (threadIdx.x >> 5u));
+}
+
+typedef struct {
+    float *out[4];
+    const unsigned char *w[4];
+    uint32_t rows[4], count;
+} qwen4_rocm_q8_projections;
+
+/* Flatten several projections into one launch, retaining the exact row
+ * arithmetic of the separate Qwen kernels. No activation conversion. */
+__global__ static void qwen4_rocm_q8_multi_kernel(qwen4_rocm_q8_projections p,
+        const float *x, uint32_t T, uint32_t K, uint64_t rb) {
+    uint32_t row = blockIdx.x * 4u + (threadIdx.x >> 5u);
+    for (uint32_t i = 0; i < p.count; i++) {
+        if (row < p.rows[i]) {
+            qwen4_rocm_q8_small_row(p.out[i], p.w[i], x, T, K, p.rows[i], rb, row);
+            return;
+        }
+        row -= p.rows[i];
+    }
+}
+
+/* Low-rank HC up matrices have many short rows. Four independent waves
+ * cover four outputs and reuse each FP16 weight across the verifier rows;
+ * the generic 256-thread-per-row matmul also repeats weights across tokens. */
+__global__ static void qwen4_rocm_f16_short_kernel(
+        float *out, const __half *w, const float *x,
+        uint32_t T, uint32_t K, uint32_t M) {
+    const uint32_t row = blockIdx.x * 4u + threadIdx.x / 32u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= M) return;
+    float acc[8] = {};
+    for (uint32_t i = lane; i < K; i += 32u) {
+        const float v = __half2float(w[(uint64_t)row * K + i]);
+        for (uint32_t t = 0; t < T; t++) acc[t] += v * x[(uint64_t)t * K + i];
+    }
+    for (uint32_t t = 0; t < T; t++) {
+        const float v = qwen4_rocm_wave32_sum_xor(acc[t]);
+        if (!lane) out[(uint64_t)t * M + row] = v;
     }
 }
 
@@ -165,6 +210,14 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(
                 "Qwen F16 small-batch");
 
         if (!w) return 0;
+
+        if (in_dim <= 512u && out_rows >= 256u &&
+            getenv("DS4_QWEN4_F16_ROW_REFERENCE") == NULL) {
+            qwen4_rocm_f16_short_kernel<<<(out_rows + 3u) / 4u, 128>>>(
+                (float *)out->ptr, w, (const float *)x->ptr,
+                n_tokens, in_dim, out_rows);
+            return cuda_ok(cudaGetLastError(), "Qwen F16 low-rank matvec");
+        }
 
         const dim3 grid(
             out_rows,
@@ -291,6 +344,31 @@ extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(
     if (!n_out || n_out > 4u ||
         !outs || !offsets || !types || !out_rows) {
         return 0;
+    }
+
+    bool fused = n_tokens > 0u && n_tokens <= 8u && in_dim > 0u && in_dim % 32u == 0u &&
+                 getenv("DS4_QWEN4_NO_MULTI_PROJECTION") == NULL;
+    for (uint32_t i = 0; i < n_out; i++)
+        fused = fused && types[i] == 8u && out_rows[i] > 0u && out_rows[i] % 4u == 0u;
+    if (fused) {
+        if (!x || !model_map || x->bytes < (uint64_t)n_tokens * in_dim * sizeof(float)) return 0;
+        const uint64_t rb = (uint64_t)(in_dim / 32u) * 34u;
+        qwen4_rocm_q8_projections p = {};
+        p.count = n_out;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < n_out; i++) {
+            const uint64_t bytes = (uint64_t)out_rows[i] * rb;
+            if (!outs[i] || outs[i]->bytes < (uint64_t)n_tokens * out_rows[i] * sizeof(float) ||
+                offsets[i] > model_size || bytes > model_size - offsets[i]) return 0;
+            p.out[i] = (float *)outs[i]->ptr;
+            p.rows[i] = out_rows[i];
+            p.w[i] = (const unsigned char *)cuda_model_range_ptr(model_map, offsets[i], bytes, "Qwen Q8 projections");
+            if (!p.w[i]) return 0;
+            total += out_rows[i];
+        }
+        if (total > UINT32_MAX) return 0;
+        qwen4_rocm_q8_multi_kernel<<<(total + 3u) / 4u, 128>>>(p, (const float *)x->ptr, n_tokens, in_dim, rb);
+        return cuda_ok(cudaGetLastError(), "Qwen Q8 projections");
     }
 
     for (uint32_t i = 0; i < n_out; ++i) {
@@ -487,6 +565,7 @@ __global__ static void qwen4_rocm_hc_gate_mix_kernel(
 
 __global__ static void qwen4_rocm_hc_combine_kernel(
         float *R,
+        const float *previous,
         const float *out,
         const float *inj,
         uint32_t E,
@@ -511,7 +590,8 @@ __global__ static void qwen4_rocm_hc_combine_kernel(
         const float w =
             2.0f * qwen4_rocm_sigmoid(s / (float)hc);
 
-        R[((uint64_t)tok * hc + stream) * E + d] += w * ov;
+        const uint64_t pos = ((uint64_t)tok * hc + stream) * E + d;
+        R[pos] = previous[pos] + w * ov;
     }
 }
 
@@ -738,6 +818,7 @@ extern "C" int ds4_gpu_qwen4_hc_combine_tensor(
         0
     >>>(
         (float *)R->ptr,
+        (const float *)R->ptr,
         (const float *)out->ptr,
         (const float *)inj->ptr,
         n_embd,
@@ -849,6 +930,19 @@ extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(
         return 0;
     }
 
+    if (!blk || !n_tokens || !n_embd || !n_hc || n_hc > 4u ||
+        blk->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
+        old_inj->bytes < (uint64_t)n_tokens * n_hc * n_hc * 8u * sizeof(float)) return 0;
+    if (getenv("DS4_QWEN4_HC_COPY_REFERENCE") == NULL) {
+        /* Each output element reads only its own residual. Folding the copy
+         * into combine keeps the same FMA and avoids a full residual copy. */
+        qwen4_rocm_hc_combine_kernel<<<dim3((n_embd + 255u) / 256u, n_tokens), 256>>>(
+            (float *)next_R->ptr, (const float *)R->ptr, (const float *)blk->ptr,
+            (const float *)old_inj->ptr, n_embd, n_hc);
+        return cuda_ok(cudaGetLastError(), "Qwen HC copy/combine") &&
+               ds4_gpu_qwen4_hc_norm_tensor(xn, inj_part, next_R, model_map, model_size,
+                   gamma_offset, inject_offset, weight_type, n_tokens, n_embd, n_hc, n_inject, eps);
+    }
     if (!cuda_ok(
             cudaMemcpyAsync(
                 next_R->ptr,
@@ -1107,6 +1201,46 @@ __global__ static void qwen4_rocm_gdn_scan_kernel(
     }
 }
 
+/* A wave updates one value row. The stored [head][value][key] layout is
+ * unchanged, but key columns now load/store contiguously. Keep that row in
+ * registers across the causal scan, including both speculative snapshots. */
+__global__ static void qwen4_rocm_gdn_wave_kernel(
+        float *out, float *state, const float *qkv, const float *a, const float *b,
+        uint32_t T, uint32_t Hk, uint32_t Hv, uint32_t D,
+        float *snap, uint32_t snap_t, float *snap2, uint32_t snap2_t) {
+    const uint32_t h = blockIdx.x, lane = threadIdx.x & 31u;
+    const uint32_t dv = blockIdx.y * 4u + threadIdx.x / 32u;
+    if (h >= Hv || dv >= D) return;
+    const uint32_t kh = h % Hk, C = (2u * Hk + Hv) * D;
+    const uint64_t base = ((uint64_t)h * D + dv) * D;
+    float S[8] = {};
+    for (uint32_t i = 0; lane + i * 32u < D; i++) S[i] = state[base + lane + i * 32u];
+    for (uint32_t t = 0; t < T; t++) {
+        const float *q = qkv + (uint64_t)t * C + (uint64_t)kh * D;
+        const float *k = q + (uint64_t)Hk * D;
+        const float v = qkv[(uint64_t)t * C + (uint64_t)(2u * Hk + h) * D + dv];
+        const float decay = a[(uint64_t)t * Hv + h], beta = b[(uint64_t)t * Hv + h];
+        float u = 0.0f;
+        for (uint32_t i = 0; lane + i * 32u < D; i++) {
+            S[i] *= decay;
+            u += S[i] * k[lane + i * 32u];
+        }
+        u = qwen4_rocm_wave32_sum_xor(u);
+        const float delta = (v - u) * beta;
+        float acc = 0.0f;
+        for (uint32_t i = 0; lane + i * 32u < D; i++) {
+            const uint32_t dk = lane + i * 32u;
+            S[i] += k[dk] * delta;
+            acc += S[i] * q[dk];
+            if (snap && t == snap_t) snap[base + dk] = S[i];
+            if (snap2 && t == snap2_t) snap2[base + dk] = S[i];
+        }
+        acc = qwen4_rocm_wave32_sum_xor(acc);
+        if (!lane) out[((uint64_t)t * Hv + h) * D + dv] = acc;
+    }
+    for (uint32_t i = 0; lane + i * 32u < D; i++) state[base + lane + i * 32u] = S[i];
+}
+
 __global__ static void qwen4_rocm_gdn_out_kernel(
         float *out,
         const float *z,
@@ -1341,8 +1475,15 @@ extern "C" int ds4_gpu_qwen4_gdn_scan_tensor(
         return 0;
     }
 
-    qwen4_rocm_gdn_scan_kernel<<<
-        n_v_head,
+    if (getenv("DS4_QWEN4_SERIAL_GDN")) {
+        qwen4_rocm_gdn_scan_kernel<<<n_v_head, 128>>>(
+            (float *)out->ptr, (float *)state->ptr, (const float *)qkv->ptr,
+            (const float *)a->ptr, (const float *)b->ptr, n_tokens,
+            n_k_head, n_v_head, head_dim,
+            snap_state ? (float *)snap_state->ptr : NULL, snap_tok,
+            snap2_state ? (float *)snap2_state->ptr : NULL, snap2_tok);
+    } else qwen4_rocm_gdn_wave_kernel<<<
+        dim3(n_v_head, (head_dim + 3u) / 4u),
         128
     >>>(
         (float *)out->ptr,

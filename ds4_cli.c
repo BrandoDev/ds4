@@ -2014,6 +2014,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.raw_prompt = true;
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--cpu-experts")) {
+            c.engine.cpu_experts = true;
+        } else if (!strcmp(arg, "--gpu-memory-budget")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &c.engine.gpu_memory_budget_bytes)) {
+                fprintf(stderr, "ds4: --gpu-memory-budget requires a positive GiB value\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--gpu-expert-layers")) {
+            c.engine.gpu_expert_layers = (uint32_t)parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.gpu_expert_layers_set = true;
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {

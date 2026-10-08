@@ -142,12 +142,71 @@ __device__ static float qwen4_rocm_expert_dot(
     return sum;
 }
 
+/* A wave owns a row: adjacent lanes read adjacent activations and encoded
+ * values. Float operands and quantized model bytes are unchanged; only the
+ * float reduction tree differs from the serial reference. */
+__device__ static float qwen4_rocm_expert_value(const char *row, uint32_t type, uint32_t i) {
+    if (type == 18u || type == 16u) {
+        const uint8_t *p = (const uint8_t *)row + (uint64_t)(i / 256u) * (type == 18u ? 98u : 66u);
+        const uint32_t group = (i % 256u) / 32u, pair = (i % 32u) / 8u, j = i % 8u;
+        const uint8_t *a = p + (type == 18u ? 66u + group * 4u : 6u + group * 8u);
+        const uint32_t aux = (uint32_t)a[0] | ((uint32_t)a[1] << 8u) |
+                             ((uint32_t)a[2] << 16u) | ((uint32_t)a[3] << 24u);
+        const uint8_t signs = cuda_ksigns_iq2xs[(aux >> (pair * 7u)) & 127u];
+        float v, scale;
+        const float d = __half2float(*reinterpret_cast<const __half *>(p));
+        if (type == 18u) {
+            const uint32_t grid = qwen4_rocm_iq3_grid[p[2u + group * 8u + pair * 2u + j / 4u]];
+            v = (float)((grid >> ((j % 4u) * 8u)) & 255u);
+            scale = d * (0.5f + (float)(aux >> 28u)) * 0.5f;
+        } else {
+            const uint64_t grid = cuda_iq2xxs_grid[p[2u + group * 8u + pair]];
+            v = (float)((grid >> (j * 8u)) & 255u);
+            scale = 0.125f * d * (float)(2u * (aux >> 28u) + 1u);
+        }
+        return scale * ((signs & (1u << j)) ? -v : v);
+    }
+    if (type == 10u) {
+        const cuda_block_q2_K *b = ((const cuda_block_q2_K *)row) + i / 256u;
+        const uint32_t j = i % 256u, s = b->scales[j / 16u];
+        const uint32_t q = (b->qs[(j / 128u) * 32u + j % 32u] >> (2u * ((j % 128u) / 32u))) & 3u;
+        return __half2float(*reinterpret_cast<const __half *>(&b->d)) * (s & 15u) * q -
+               __half2float(*reinterpret_cast<const __half *>(&b->dmin)) * (s >> 4u);
+    }
+    if (type == 12u) {
+        const uint8_t *p = (const uint8_t *)row + (uint64_t)(i / 256u) * 144u;
+        const uint32_t j = i % 256u, g = j / 32u;
+        const uint8_t *sc = p + 4u;
+        const uint32_t s = g < 4u ? sc[g] & 63u : (sc[g + 4u] & 15u) | ((sc[g - 4u] & 0xc0u) >> 2u);
+        const uint32_t mn = g < 4u ? sc[g + 4u] & 63u : (sc[g + 4u] >> 4u) | ((sc[g] & 0xc0u) >> 2u);
+        const uint32_t q = (p[16u + (g / 2u) * 32u + j % 32u] >> ((g % 2u) * 4u)) & 15u;
+        return __half2float(*reinterpret_cast<const __half *>(p)) * (float)s * (float)q -
+               __half2float(*reinterpret_cast<const __half *>(p + 2u)) * (float)mn;
+    }
+    if (type == 39u) {
+        const uint8_t *p = (const uint8_t *)row + (uint64_t)(i / 32u) * 17u;
+        const uint32_t j = i % 32u, packed = p[1u + j % 16u];
+        const uint32_t code = j < 16u ? packed & 15u : packed >> 4u, mag_code = code & 7u;
+        const float mag = mag_code <= 4u ? 0.5f * (float)mag_code :
+                          mag_code == 5u ? 3.0f : mag_code == 6u ? 4.0f : 6.0f;
+        return dev_e8m0_to_f32(p[0]) * ((code & 8u) ? -mag : mag);
+    }
+    return qwen4_rocm_weight_at(row, type, i);
+}
+
+__device__ static float qwen4_rocm_expert_dot_wave(const char *row, const float *x, uint32_t type, uint32_t K) {
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x & 31u; i < K; i += 32u)
+        sum += qwen4_rocm_expert_value(row, type, i) * x[i];
+    return qwen4_rocm_wave32_sum_xor(sum);
+}
+
 __global__ static void qwen4_rocm_moe_mid_kernel(
         float *mid, const float *x, const int *sel, const int *remap,
         const char *gate, const char *up, const char *sh_gate, const char *sh_up,
         uint32_t type, uint32_t shared_type, uint32_t NE, uint32_t T,
-        uint32_t NS, uint32_t K, uint32_t M, uint64_t rb, uint64_t srb) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t NS, uint32_t K, uint32_t M, uint64_t rb, uint64_t srb, bool wave) {
+    const uint32_t row = wave ? blockIdx.x * 4u + (threadIdx.x >> 5u) : blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t slot = blockIdx.y, t = blockIdx.z;
     if (row >= M) return;
     const bool shared = slot == NS;
@@ -167,17 +226,18 @@ __global__ static void qwen4_rocm_moe_mid_kernel(
         wt = type;
     }
     const float *xt = x + (uint64_t)t * K;
-    const float a = qwen4_rocm_expert_dot(wg, xt, wt, K);
-    const float b = qwen4_rocm_expert_dot(wu, xt, wt, K);
-    mid[((uint64_t)t * stride + slot) * M + row] = qwen4_rocm_silu(a) * b;
+    const float a = wave ? qwen4_rocm_expert_dot_wave(wg, xt, wt, K) : qwen4_rocm_expert_dot(wg, xt, wt, K);
+    const float b = wave ? qwen4_rocm_expert_dot_wave(wu, xt, wt, K) : qwen4_rocm_expert_dot(wu, xt, wt, K);
+    if (!wave || !(threadIdx.x & 31u))
+        mid[((uint64_t)t * stride + slot) * M + row] = qwen4_rocm_silu(a) * b;
 }
 
 __global__ static void qwen4_rocm_moe_down_kernel(
         float *part, const float *mid, const int *sel, const int *remap,
         const char *down, const char *sh_down, uint32_t type,
         uint32_t shared_type, uint32_t NE, uint32_t NS, uint32_t K,
-        uint32_t M, uint64_t rb, uint64_t srb) {
-    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t M, uint64_t rb, uint64_t srb, bool wave) {
+    const uint32_t row = wave ? blockIdx.x * 4u + (threadIdx.x >> 5u) : blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t slot = blockIdx.y, t = blockIdx.z;
     if (row >= M) return;
     const bool shared = slot == NS;
@@ -195,7 +255,8 @@ __global__ static void qwen4_rocm_moe_down_kernel(
         wt = type;
     }
     const float *x = mid + ((uint64_t)t * stride + slot) * K;
-    part[((uint64_t)t * stride + slot) * M + row] = qwen4_rocm_expert_dot(w, x, wt, K);
+    const float value = wave ? qwen4_rocm_expert_dot_wave(w, x, wt, K) : qwen4_rocm_expert_dot(w, x, wt, K);
+    if (!wave || !(threadIdx.x & 31u)) part[((uint64_t)t * stride + slot) * M + row] = value;
 }
 
 extern "C" int ds4_gpu_qwen4_moe_mid_tensor(
@@ -220,9 +281,10 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(
     const char *sg = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, sgo, sb, "Qwen shared gate");
     const char *su = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, suo, sb, "Qwen shared up");
     if (!g || !u || (st != UINT32_MAX && (!sg || !su))) return 0;
-    qwen4_rocm_moe_mid_kernel<<<dim3((M + 63u) / 64u, stride, T), 64>>>(
+    const bool wave = getenv("DS4_QWEN4_MOE_SERIAL") == NULL;
+    qwen4_rocm_moe_mid_kernel<<<dim3((M + (wave ? 3u : 63u)) / (wave ? 4u : 64u), stride, T), wave ? 128 : 64>>>(
         (float *)mid->ptr, (const float *)x->ptr, (const int *)sel->ptr, remap,
-        g, u, sg, su, type, st, NE, T, NS, K, M, rb, srb);
+        g, u, sg, su, type, st, NE, T, NS, K, M, rb, srb, wave);
     return cuda_ok(cudaGetLastError(), "Qwen MoE mid");
 }
 
@@ -247,9 +309,10 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(
                                      &w, NULL, &remap)) return 0;
     const char *sw = st == UINT32_MAX ? NULL : cuda_model_range_ptr(map, so, sb, "Qwen shared down");
     if (!w || (st != UINT32_MAX && !sw)) return 0;
-    qwen4_rocm_moe_down_kernel<<<dim3((M + 63u) / 64u, stride, T), 64>>>(
+    const bool wave = getenv("DS4_QWEN4_MOE_SERIAL") == NULL;
+    qwen4_rocm_moe_down_kernel<<<dim3((M + (wave ? 3u : 63u)) / (wave ? 4u : 64u), stride, T), wave ? 128 : 64>>>(
         (float *)part->ptr, (const float *)mid->ptr, (const int *)sel->ptr, remap,
-        w, sw, type, st, NE, NS, K, M, rb, srb);
+        w, sw, type, st, NE, NS, K, M, rb, srb, wave);
     return cuda_ok(cudaGetLastError(), "Qwen MoE down");
 }
 
@@ -402,8 +465,63 @@ extern "C" int ds4_gpu_qwen4_moe_mm_down_tensor(
 }
 
 extern "C" int ds4_gpu_qwen4_release_layer_weights(void) {
+    /* Resident layers have no temporary weight allocation to retire. */
+    if (g_model_ranges.size() == 0) return 1;
     if (!cuda_ok(cudaDeviceSynchronize(), "Qwen layer weight release sync")) return 0;
     cuda_model_range_release_ranges_only();
+    return 1;
+}
+
+extern "C" int ds4_gpu_qwen4_set_memory_budget(uint64_t bytes) {
+    int device = 0;
+    char pci[32] = {0};
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetPCIBusId(pci, sizeof(pci), device) != hipSuccess) return 0;
+    snprintf(g_qwen4_vram_used_path, sizeof(g_qwen4_vram_used_path),
+             "/sys/bus/pci/devices/%s/mem_info_vram_used", pci);
+    size_t free_bytes = 0, total = 0;
+    if (!qwen4_memory_info(&free_bytes, &total)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "cannot read device VRAM accounting at %s\n", g_qwen4_vram_used_path);
+        return 0;
+    }
+    /* Even an oversized user budget leaves at least 2 GiB device headroom. */
+    const uint64_t reserve = 2ull * 1073741824ull;
+    if (total <= reserve || bytes <= 1073741824ull) return 0;
+    g_qwen4_memory_budget = bytes < total - reserve ? bytes : total - reserve;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "Qwen total GPU usage budget %.2f GiB (device %.2f GiB, already used %.2f GiB; HIP + amdgpu counters)\n",
+            (double)g_qwen4_memory_budget / 1073741824.0, (double)total / 1073741824.0,
+            (double)(total - free_bytes) / 1073741824.0);
+    return qwen4_memory_fits(0);
+}
+
+extern "C" uint64_t ds4_gpu_qwen4_resident_available(void) {
+    size_t free_bytes = 0, total = 0;
+    if (!g_qwen4_memory_budget || !qwen4_memory_info(&free_bytes, &total)) return 0;
+    const uint64_t used = total - free_bytes;
+    /* Keep 1 GiB inside the ceiling for transient kernels and lazy buffers. */
+    const uint64_t scratch = 1073741824ull;
+    return used < g_qwen4_memory_budget && g_qwen4_memory_budget - used > scratch
+        ? g_qwen4_memory_budget - used - scratch : 0;
+}
+
+extern "C" int ds4_gpu_qwen4_cache_resident(const void *map, uint64_t size,
+                                             uint64_t offset, uint64_t bytes) {
+    if (!map || !bytes || offset > size || bytes > size - offset) return 0;
+    if (cuda_model_image_range_ptr(map, offset, bytes)) return 1;
+    if (g_qwen4_resident_count == 2048 || bytes > ds4_gpu_qwen4_resident_available()) return 0;
+    void *ptr = NULL;
+    if (!cuda_ok(cudaMalloc(&ptr, (size_t)bytes), "Qwen resident weights")) return 0;
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    for (uint64_t done = 0; done < bytes; done += chunk) {
+        const uint64_t n = bytes - done < chunk ? bytes - done : chunk;
+        if (!cuda_ok(cudaMemcpy((char *)ptr + done, (const char *)map + offset + done,
+                               (size_t)n, cudaMemcpyHostToDevice), "Qwen resident copy")) {
+            (void)cudaFree(ptr);
+            return 0;
+        }
+    }
+    qwen4_resident_range *r = &g_qwen4_resident[g_qwen4_resident_count++];
+    r->map = map; r->offset = offset; r->bytes = bytes; r->ptr = (char *)ptr;
     return 1;
 }
 

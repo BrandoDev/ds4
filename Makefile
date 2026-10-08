@@ -741,6 +741,23 @@ tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-ngrams: tests/test_qwen4_ngrams
 	./tests/test_qwen4_ngrams
 
+tests/test_qwen4_cpu_experts.o: tests/test_qwen4_cpu_experts.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen4_iq3_dot: tests/test_qwen4_iq3_dot.c ds4.c ds4_iq3xxs_grid.inc
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm -pthread
+
+.PHONY: test-qwen4-iq3-dot
+test-qwen4-iq3-dot: tests/test_qwen4_iq3_dot
+	./tests/test_qwen4_iq3_dot
+
+tests/test_qwen4_cpu_experts: tests/test_qwen4_cpu_experts.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+.PHONY: test-qwen4-cpu-experts
+test-qwen4-cpu-experts: tests/test_qwen4_cpu_experts
+	./tests/test_qwen4_cpu_experts "$(DS4_TEST_MODEL)"
+
 tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1068,7 +1085,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
 	rm -f tests/test_qwen4_ngrams
-	rm -f tests/test_qwen4_ngram_state
+	rm -f tests/test_qwen4_cpu_experts tests/test_qwen4_iq3_dot tests/test_qwen4_ngram_state
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory

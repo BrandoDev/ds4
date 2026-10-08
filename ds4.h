@@ -150,6 +150,10 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
+    bool cpu_experts; /* Qwen ROCm: routed MoE on CPU, dense graph on GPU. */
+    uint64_t gpu_memory_budget_bytes; /* Qwen ROCm: total device usage ceiling, including caches. */
+    uint32_t gpu_expert_layers; /* Maximum resident trunk prefix; fitted to the budget. */
+    bool gpu_expert_layers_set;
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;

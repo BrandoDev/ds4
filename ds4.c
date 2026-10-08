@@ -40,6 +40,9 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #include "ds4.h"
 #include "ds4_tool_text.h"
@@ -4384,6 +4387,226 @@ static float ds4_vec_dot_iq3_xxs_f32(int physical, int logical,
     }
     return sum;
 }
+
+#if (defined(DS4_ROCM_BUILD) || defined(DS4_TEST_HOOKS)) && defined(__AVX2__)
+/* Four signed grid values fit in one word. The 16 KiB table removes bit
+ * extraction/sign branches from each multiply without expanding model rows
+ * or quantizing activations. Only the hybrid expert path uses this kernel;
+ * the scalar CPU reference above remains independent. */
+static uint32_t qwen4_iq3_signed_grid[256][16];
+static uint64_t qwen4_iq3_byte_signs[128];
+static pthread_once_t qwen4_iq3_grid_once = PTHREAD_ONCE_INIT;
+
+static void qwen4_iq3_grid_init(void) {
+    for (uint32_t s = 0; s < 128; s++) {
+        uint64_t packed = 0;
+        for (uint32_t j = 0; j < 8; j++)
+            packed |= (uint64_t)(uint8_t)((ksigns_iq2xs[s] & (1u << j)) ? -1 : 1) << (j * 8);
+        qwen4_iq3_byte_signs[s] = packed;
+    }
+    for (uint32_t g = 0; g < 256; g++) for (uint32_t s = 0; s < 16; s++) {
+        uint32_t packed = 0;
+        for (uint32_t j = 0; j < 4; j++) {
+            int v = (int)((iq3xxs_grid[g] >> (j * 8u)) & 255u);
+            if (s & (1u << j)) v = -v;
+            packed |= (uint32_t)(uint8_t)v << (j * 8u);
+        }
+        qwen4_iq3_signed_grid[g][s] = packed;
+    }
+}
+
+static float qwen4_iq3_dot_avx2(int physical, int logical,
+                               const uint8_t *row, const float *x) {
+    if (physical <= 0 || physical % 256 || logical <= 0 || logical > physical || logical % 8)
+        return ds4_vec_dot_iq3_xxs_f32(physical, logical, row, x);
+    pthread_once(&qwen4_iq3_grid_once, qwen4_iq3_grid_init);
+    __m256 acc = _mm256_setzero_ps();
+    for (int block = 0; block * 256 < logical; block++) {
+        const uint8_t *p = row + (size_t)block * 98;
+        uint16_t dh;
+        memcpy(&dh, p, 2);
+        const float d = f16_to_f32(dh);
+        const int remaining = logical - block * 256;
+        const int groups = remaining < 256 ? (remaining + 31) / 32 : 8;
+        for (int group = 0; group < groups; group++) {
+            uint32_t aux;
+            memcpy(&aux, p + 66 + group * 4, 4);
+            const __m256 scale = _mm256_set1_ps(d * (0.5f + (float)(aux >> 28)) * 0.5f);
+            for (int pair = 0; pair < 4; pair++) {
+                const int base = block * 256 + group * 32 + pair * 8;
+                if (base >= logical) break;
+                const uint8_t signs = ksigns_iq2xs[(aux >> (pair * 7)) & 127u];
+                const uint8_t *qs = p + 2 + group * 8 + pair * 2;
+                const uint64_t grid = qwen4_iq3_signed_grid[qs[0]][signs & 15u] |
+                    ((uint64_t)qwen4_iq3_signed_grid[qs[1]][signs >> 4] << 32);
+                const __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128((int64_t)grid)));
+                acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_mul_ps(v, scale), _mm256_loadu_ps(x + base)));
+            }
+        }
+    }
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    sum = _mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1));
+    return _mm_cvtss_f32(sum);
+}
+
+static float qwen4_iq3_sum_avx2(__m256 acc) {
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    sum = _mm_add_ps(sum, _mm_movehl_ps(sum, sum));
+    return _mm_cvtss_f32(_mm_add_ss(sum, _mm_shuffle_ps(sum, sum, 1)));
+}
+
+/* Experimental hybrid activation quantization. Pad only the last block;
+ * Q8 values are restricted to [-127,127] so byte sign reversal is exact. */
+static void qwen4_quantize_q8(int logical, const float *x, block_q8_K *out) {
+    const int full = logical / 256;
+    if (full) ds4_quantize_row_q8_K(x, out, full * 256);
+    if (logical % 256) {
+        float tail[256] = {0};
+        memcpy(tail, x + full * 256, (logical % 256) * sizeof(float));
+        ds4_quantize_row_q8_K(tail, out + full, 256);
+    }
+    for (int b = 0; b < (logical + 255) / 256; b++)
+        for (int k = 0; k < 256; k++)
+            if (out[b].qs[k] == -128) {
+                out[b].qs[k] = -127;
+                out[b].bsums[k / 16]++;
+            }
+}
+
+static void qwen4_iq3_q8_many(int logical, const uint8_t *row,
+                              const block_q8_K *const *x, float *out, uint32_t count) {
+    pthread_once(&qwen4_iq3_grid_once, qwen4_iq3_grid_init);
+    __m256 acc[4];
+    for (uint32_t t = 0; t < count; t++) acc[t] = _mm256_setzero_ps();
+    for (int b = 0; b < (logical + 255) / 256; b++) {
+        const uint8_t *p = row + (size_t)b * 98;
+        uint16_t dh; memcpy(&dh, p, 2);
+        __m256i sums[4];
+        for (uint32_t t = 0; t < count; t++) sums[t] = _mm256_setzero_si256();
+        for (int group = 0; group < 8; group++) {
+            uint32_t aux; memcpy(&aux, p + 66 + group * 4, 4);
+            const uint8_t *qs = p + 2 + group * 8;
+            const __m256i magnitude = _mm256_set_epi32(iq3xxs_grid[qs[7]], iq3xxs_grid[qs[6]],
+                iq3xxs_grid[qs[5]], iq3xxs_grid[qs[4]], iq3xxs_grid[qs[3]], iq3xxs_grid[qs[2]],
+                iq3xxs_grid[qs[1]], iq3xxs_grid[qs[0]]);
+            const __m256i signs = _mm256_set_epi64x(qwen4_iq3_byte_signs[(aux >> 21) & 127u],
+                qwen4_iq3_byte_signs[(aux >> 14) & 127u], qwen4_iq3_byte_signs[(aux >> 7) & 127u],
+                qwen4_iq3_byte_signs[aux & 127u]);
+            const __m256i scale = _mm256_set1_epi16(2 * (aux >> 28) + 1);
+            for (uint32_t t = 0; t < count; t++) {
+                const __m256i q = _mm256_loadu_si256((const __m256i *)(x[t][b].qs + group * 32));
+                const __m256i product = _mm256_maddubs_epi16(magnitude, _mm256_sign_epi8(q, signs));
+                sums[t] = _mm256_add_epi32(sums[t], _mm256_madd_epi16(product, scale));
+            }
+        }
+        for (uint32_t t = 0; t < count; t++) {
+            const __m256 scale = _mm256_set1_ps(f16_to_f32(dh) * x[t][b].d * 0.25f);
+            acc[t] = _mm256_add_ps(acc[t], _mm256_mul_ps(_mm256_cvtepi32_ps(sums[t]), scale));
+        }
+    }
+    for (uint32_t t = 0; t < count; t++) out[t] = qwen4_iq3_sum_avx2(acc[t]);
+}
+
+/* Tokens routed to the same expert share its row decode. Keep accumulators
+ * independent so grouping changes scheduling, never the routing or inputs. */
+
+static void qwen4_iq3_dot_many(int logical, const uint8_t *row,
+                              const float *const *x, float *out, uint32_t count) {
+    if (count == 1u) {
+        out[0] = qwen4_iq3_dot_avx2((logical + 255) / 256 * 256, logical, row, x[0]);
+        return;
+    }
+    pthread_once(&qwen4_iq3_grid_once, qwen4_iq3_grid_init);
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    for (int block = 0; block * 256 < logical; block++) {
+        const uint8_t *p = row + (size_t)block * 98;
+        uint16_t dh; memcpy(&dh, p, 2);
+        const float d = f16_to_f32(dh);
+        const int remaining = logical - block * 256;
+        const int groups = remaining < 256 ? (remaining + 31) / 32 : 8;
+        for (int group = 0; group < groups; group++) {
+            uint32_t aux; memcpy(&aux, p + 66 + group * 4, 4);
+            const __m256 scale = _mm256_set1_ps(d * (0.5f + (float)(aux >> 28)) * 0.5f);
+            for (int pair = 0; pair < 4; pair++) {
+                const int base = block * 256 + group * 32 + pair * 8;
+                if (base >= logical) break;
+                const uint8_t signs = ksigns_iq2xs[(aux >> (pair * 7)) & 127u];
+                const uint8_t *qs = p + 2 + group * 8 + pair * 2;
+                const uint64_t grid = qwen4_iq3_signed_grid[qs[0]][signs & 15u] |
+                    ((uint64_t)qwen4_iq3_signed_grid[qs[1]][signs >> 4] << 32);
+                const __m256 v = _mm256_mul_ps(scale, _mm256_cvtepi32_ps(
+                    _mm256_cvtepi8_epi32(_mm_cvtsi64_si128((int64_t)grid))));
+                a0 = _mm256_add_ps(a0, _mm256_mul_ps(v, _mm256_loadu_ps(x[0] + base)));
+                if (count > 1) a1 = _mm256_add_ps(a1, _mm256_mul_ps(v, _mm256_loadu_ps(x[1] + base)));
+                if (count > 2) a2 = _mm256_add_ps(a2, _mm256_mul_ps(v, _mm256_loadu_ps(x[2] + base)));
+                if (count > 3) a3 = _mm256_add_ps(a3, _mm256_mul_ps(v, _mm256_loadu_ps(x[3] + base)));
+            }
+        }
+    }
+    out[0] = qwen4_iq3_sum_avx2(a0);
+    if (count > 1) out[1] = qwen4_iq3_sum_avx2(a1);
+    if (count > 2) out[2] = qwen4_iq3_sum_avx2(a2);
+    if (count > 3) out[3] = qwen4_iq3_sum_avx2(a3);
+}
+/* Gate and up consume the same activations. Interleave their row decoders
+ * to load each activation vector once; each sum keeps its own SIMD order. */
+static void qwen4_iq3_gate_up_many(int logical, const uint8_t *gate, const uint8_t *up,
+        const float *const *x, float *g, float *u, uint32_t count) {
+    pthread_once(&qwen4_iq3_grid_once, qwen4_iq3_grid_init);
+    __m256 g0 = _mm256_setzero_ps(), g1 = g0, g2 = g0, g3 = g0;
+    __m256 u0 = g0, u1 = g0, u2 = g0, u3 = g0;
+    for (int block = 0; block * 256 < logical; block++) {
+        const uint8_t *pg = gate + (size_t)block * 98, *pu = up + (size_t)block * 98;
+        uint16_t hg, hu; memcpy(&hg, pg, 2); memcpy(&hu, pu, 2);
+        const float dg = f16_to_f32(hg), du = f16_to_f32(hu);
+        const int remaining = logical - block * 256;
+        const int groups = remaining < 256 ? (remaining + 31) / 32 : 8;
+        for (int group = 0; group < groups; group++) {
+            uint32_t ag, au;
+            memcpy(&ag, pg + 66 + group * 4, 4); memcpy(&au, pu + 66 + group * 4, 4);
+            const __m256 sg = _mm256_set1_ps(dg * (0.5f + (float)(ag >> 28)) * 0.5f);
+            const __m256 su = _mm256_set1_ps(du * (0.5f + (float)(au >> 28)) * 0.5f);
+            for (int pair = 0; pair < 4; pair++) {
+                const int base = block * 256 + group * 32 + pair * 8;
+                if (base >= logical) break;
+                const uint8_t signg = ksigns_iq2xs[(ag >> (pair * 7)) & 127u];
+                const uint8_t signu = ksigns_iq2xs[(au >> (pair * 7)) & 127u];
+                const uint8_t *qg = pg + 2 + group * 8 + pair * 2;
+                const uint8_t *qu = pu + 2 + group * 8 + pair * 2;
+                const uint64_t vg = qwen4_iq3_signed_grid[qg[0]][signg & 15u] |
+                    ((uint64_t)qwen4_iq3_signed_grid[qg[1]][signg >> 4] << 32);
+                const uint64_t vu = qwen4_iq3_signed_grid[qu[0]][signu & 15u] |
+                    ((uint64_t)qwen4_iq3_signed_grid[qu[1]][signu >> 4] << 32);
+                const __m256 wg = _mm256_mul_ps(sg, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128((int64_t)vg))));
+                const __m256 wu = _mm256_mul_ps(su, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_cvtsi64_si128((int64_t)vu))));
+                __m256 a = _mm256_loadu_ps(x[0] + base);
+                g0 = _mm256_add_ps(g0, _mm256_mul_ps(wg, a));
+                u0 = _mm256_add_ps(u0, _mm256_mul_ps(wu, a));
+                if (count > 1) {
+                    a = _mm256_loadu_ps(x[1] + base);
+                    g1 = _mm256_add_ps(g1, _mm256_mul_ps(wg, a));
+                    u1 = _mm256_add_ps(u1, _mm256_mul_ps(wu, a));
+                }
+                if (count > 2) {
+                    a = _mm256_loadu_ps(x[2] + base);
+                    g2 = _mm256_add_ps(g2, _mm256_mul_ps(wg, a));
+                    u2 = _mm256_add_ps(u2, _mm256_mul_ps(wu, a));
+                }
+                if (count > 3) {
+                    a = _mm256_loadu_ps(x[3] + base);
+                    g3 = _mm256_add_ps(g3, _mm256_mul_ps(wg, a));
+                    u3 = _mm256_add_ps(u3, _mm256_mul_ps(wu, a));
+                }
+            }
+        }
+    }
+    g[0] = qwen4_iq3_sum_avx2(g0); u[0] = qwen4_iq3_sum_avx2(u0);
+    if (count > 1) { g[1] = qwen4_iq3_sum_avx2(g1); u[1] = qwen4_iq3_sum_avx2(u1); }
+    if (count > 2) { g[2] = qwen4_iq3_sum_avx2(g2); u[2] = qwen4_iq3_sum_avx2(u2); }
+    if (count > 3) { g[3] = qwen4_iq3_sum_avx2(g3); u[3] = qwen4_iq3_sum_avx2(u3); }
+}
+#endif
 
 static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float *y) {
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
@@ -42327,6 +42550,10 @@ struct ds4_engine {
     uint64_t startup_model_span_bytes;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
+    bool cpu_experts;
+    uint64_t gpu_memory_budget_bytes, qwen4_gpu_expert_mask;
+    uint32_t gpu_expert_layers;
+    bool qwen4_resident_ready;
     bool glm_mtp;
     bool glm_mtp_timing;
     bool dspark;
@@ -42469,6 +42696,13 @@ static void ds4_engine_print_startup_memory(
 #endif
     const uint64_t kv_bytes =
         ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
+    if (e->gpu_memory_budget_bytes) {
+        fprintf(stderr, "ds4: memory: Qwen GPU usage ceiling %.2f GiB, estimated context/buffers %.2f GiB; %.2f GiB host-backed weights, n-grams disk-only\n",
+                ds4_bytes_to_gib(e->gpu_memory_budget_bytes),
+                ds4_bytes_to_gib(ds4_add_sat_u64(kv_bytes, mem.scratch_bytes)),
+                ds4_bytes_to_gib(e->model.size - e->model.tensor_data_pos));
+        return;
+    }
     const uint64_t dynamic_expert_cache_bytes =
         ds4_engine_dynamic_expert_cache_bytes(e);
     const uint64_t expert_reserved_bytes =
@@ -57592,6 +57826,154 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     *count = n;
     return spans;
 }
+typedef struct {
+    uint32_t expert, count, slots[4];
+} qwen4_cpu_expert_group;
+
+#if defined(DS4_ROCM_BUILD) || defined(DS4_TEST_HOOKS)
+/* CPU placement defaults to float activations and applies router weights only
+ * in the GPU reducer, exactly as the ordinary expert kernels do. Padding in
+ * Q2/IQ3 down rows is storage, not additional model inputs. */
+typedef struct {
+    const ds4_model *model;
+    const ds4_layer_weights *layer;
+    const float *x;
+    const int *selected;
+    float *mid, *part;
+    const qwen4_cpu_expert_group *groups;
+    uint64_t next_row, rows;
+    ds4_parallel_fn projection;
+    bool fuse_gate_up;
+    uint32_t trace_mxcsr;
+    const block_q8_K *xq, *midq;
+} qwen4_cpu_expert_job;
+
+static float qwen4_cpu_expert_dot(const ds4_model *m, const ds4_tensor *w,
+                                    uint64_t row, const float *x, uint32_t logical,
+                                    float *scratch) {
+    const uint32_t physical = (uint32_t)w->dim[0];
+    const uint8_t *base = tensor_data(m, w);
+    if (w->type == DS4_TENSOR_IQ3_XXS) {
+#if defined(__AVX2__)
+        return qwen4_iq3_dot_avx2((int)physical, (int)logical,
+                                 base + row * (physical / 256u) * 98u, x);
+#else
+        return ds4_vec_dot_iq3_xxs_f32((int)physical, (int)logical,
+                                      base + row * (physical / 256u) * 98u, x);
+#endif
+    }
+    if (w->type == DS4_TENSOR_IQ2_XXS)
+        return ds4_vec_dot_iq2_xxs_f32((int)logical,
+            (const block_iq2_xxs *)(base + row * (physical / 256u) * 66u), x);
+    if (w->type == DS4_TENSOR_Q2_K) {
+        const block_q2_K *blocks = (const block_q2_K *)(base + row * (physical / 256u) * 84u);
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < logical; k++) sum += q2_k_value_f32(blocks, k) * x[k];
+        return sum;
+    }
+    qwen4_ref_row(m, w, row, scratch);
+    double sum = 0.0;
+    for (uint32_t k = 0; k < logical; k++) sum += (double)scratch[k] * x[k];
+    return (float)sum;
+}
+
+static void qwen4_cpu_expert_mid(void *context, uint64_t begin, uint64_t end) {
+    qwen4_cpu_expert_job *job = context;
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NS = DS4_N_EXPERT_USED;
+#if defined(__AVX2__)
+    if (job->groups) {
+        const uint8_t *gate = tensor_data(job->model, job->layer->ffn_gate_exps);
+        const uint8_t *up = tensor_data(job->model, job->layer->ffn_up_exps);
+        const uint64_t stride = (uint64_t)E / 256u * 98u;
+        for (uint64_t i = begin; i < end; i++) {
+            const qwen4_cpu_expert_group *group = &job->groups[i / F];
+            const uint64_t row = (uint64_t)group->expert * F + i % F;
+            const float *x[4]; float g[4], u[4];
+            for (uint32_t j = 0; j < group->count; j++) x[j] = job->x + (uint64_t)(group->slots[j] / NS) * E;
+            if (job->xq) {
+                const block_q8_K *q[4];
+                for (uint32_t j = 0; j < group->count; j++) q[j] = job->xq + (uint64_t)(group->slots[j] / NS) * ((E + 255) / 256);
+                qwen4_iq3_q8_many(E, gate + row * stride, q, g, group->count);
+                qwen4_iq3_q8_many(E, up + row * stride, q, u, group->count);
+            } else if (job->fuse_gate_up) qwen4_iq3_gate_up_many(E, gate + row * stride, up + row * stride, x, g, u, group->count);
+            else {
+                qwen4_iq3_dot_many(E, gate + row * stride, x, g, group->count);
+                qwen4_iq3_dot_many(E, up + row * stride, x, u, group->count);
+            }
+            for (uint32_t j = 0; j < group->count; j++)
+                job->mid[(uint64_t)group->slots[j] * F + i % F] = silu(g[j]) * u[j];
+        }
+        return;
+    }
+#endif
+    const uint32_t gt = job->layer->ffn_gate_exps->type, ut = job->layer->ffn_up_exps->type;
+    const bool direct = (gt == DS4_TENSOR_IQ3_XXS || gt == DS4_TENSOR_IQ2_XXS || gt == DS4_TENSOR_Q2_K) &&
+                        (ut == DS4_TENSOR_IQ3_XXS || ut == DS4_TENSOR_IQ2_XXS || ut == DS4_TENSOR_Q2_K);
+    float *scratch = direct ? NULL : xmalloc(E * sizeof(float));
+    for (uint64_t i = begin; i < end; i++) {
+        const uint64_t slot = i / F, row = i % F, token = slot / NS;
+        const uint64_t expert_row = (uint64_t)job->selected[slot] * F + row;
+        const float *x = job->x + token * E;
+        const float gate = qwen4_cpu_expert_dot(job->model, job->layer->ffn_gate_exps, expert_row, x, E, scratch);
+        const float up = qwen4_cpu_expert_dot(job->model, job->layer->ffn_up_exps, expert_row, x, E, scratch);
+        job->mid[i] = silu(gate) * up;
+    }
+    free(scratch);
+}
+
+static void qwen4_cpu_expert_down(void *context, uint64_t begin, uint64_t end) {
+    qwen4_cpu_expert_job *job = context;
+#if defined(__AVX2__)
+    if (job->midq && getenv("DS4_QWEN4_CPU_TRACE"))
+        __atomic_fetch_or(&job->trace_mxcsr, 1u << (((_mm_getcsr() >> 13) & 7u) | ((_mm_getcsr() & 64u) >> 3)), __ATOMIC_RELAXED);
+#endif
+    const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP;
+#if defined(__AVX2__)
+    if (job->groups) {
+        const uint8_t *down = tensor_data(job->model, job->layer->ffn_down_exps);
+        const uint64_t stride = job->layer->ffn_down_exps->dim[0] / 256u * 98u;
+        for (uint64_t i = begin; i < end; i++) {
+            const qwen4_cpu_expert_group *group = &job->groups[i / E];
+            const uint64_t row = (uint64_t)group->expert * E + i % E;
+            const float *x[4]; float out[4];
+            for (uint32_t j = 0; j < group->count; j++) x[j] = job->mid + (uint64_t)group->slots[j] * F;
+            if (job->midq) {
+                const block_q8_K *q[4];
+                for (uint32_t j = 0; j < group->count; j++) q[j] = job->midq + (uint64_t)group->slots[j] * ((F + 255) / 256);
+                qwen4_iq3_q8_many(F, down + row * stride, q, out, group->count);
+            } else qwen4_iq3_dot_many(F, down + row * stride, x, out, group->count);
+            for (uint32_t j = 0; j < group->count; j++)
+                job->part[(uint64_t)group->slots[j] * E + i % E] = out[j];
+        }
+        return;
+    }
+#endif
+    const uint32_t type = job->layer->ffn_down_exps->type;
+    float *scratch = (type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_Q2_K)
+        ? NULL : xmalloc(job->layer->ffn_down_exps->dim[0] * sizeof(float));
+    for (uint64_t i = begin; i < end; i++) {
+        const uint64_t slot = i / E, row = i % E;
+        const uint64_t expert_row = (uint64_t)job->selected[slot] * E + row;
+        job->part[i] = qwen4_cpu_expert_dot(job->model, job->layer->ffn_down_exps,
+                                             expert_row, job->mid + slot * F, F, scratch);
+    }
+    free(scratch);
+}
+
+/* Groups contain one to four tokens. Small dynamically claimed slices keep
+ * unequal groups from stranding a core, without changing row arithmetic. */
+static void qwen4_cpu_expert_work(void *context, uint64_t begin, uint64_t end) {
+    (void)begin; (void)end;
+    qwen4_cpu_expert_job *job = context;
+    for (;;) {
+        const uint64_t row = __atomic_fetch_add(&job->next_row, 64u, __ATOMIC_RELAXED);
+        if (row >= job->rows) break;
+        const uint64_t limit = row + 64u < job->rows ? row + 64u : job->rows;
+        job->projection(job, row, limit);
+    }
+}
+
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next GPU graph.  One command batch per forward; f32
@@ -57705,6 +58087,16 @@ typedef struct ds4_qwen4_gpu_graph {
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
+    bool cpu_experts;
+    uint64_t gpu_expert_mask;
+    const ds4_layer_weights *layer_weights;
+    float *cpu_expert_x, *cpu_expert_mid, *cpu_expert_part;
+    int *cpu_expert_selected;
+    qwen4_cpu_expert_group *cpu_expert_groups;
+    block_q8_K *cpu_expert_xq, *cpu_expert_midq;
+    void *cpu_expert_host;
+    bool cpu_expert_pinned;
+    uint64_t cpu_trace_sequence; /* diagnostic reset identity */
     ds4_gpu_tensor *steer_dirs;
     float steer_attn_scale;
     float steer_ffn_scale;
@@ -57861,6 +58253,24 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         free(g->host_row);
     }
     g->host_row = NULL;
+#ifdef DS4_ROCM_BUILD
+    if (g->cpu_expert_host) {
+        if (g->cpu_expert_pinned) ds4_gpu_qwen4_host_free(g->cpu_expert_host);
+        else free(g->cpu_expert_host);
+    }
+#endif
+    if (!g->cpu_expert_host) {
+        free(g->cpu_expert_x);
+        free(g->cpu_expert_part);
+        free(g->cpu_expert_selected);
+    }
+    g->cpu_expert_host = NULL;
+    free(g->cpu_expert_mid);
+    free(g->cpu_expert_groups);
+    free(g->cpu_expert_xq);
+    free(g->cpu_expert_midq);
+    g->cpu_expert_x = g->cpu_expert_mid = g->cpu_expert_part = NULL;
+    g->cpu_expert_selected = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -57981,6 +58391,7 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
+    g->layer_weights = w->layer;
 #ifdef DS4_ROCM_BUILD
     ds4_gpu_qwen4_use_device_weight_copies();
 #endif
@@ -58205,6 +58616,7 @@ static void qwen4_graph_dump_last_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint
 }
 
 static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
+    g->cpu_trace_sequence++;
     (void)ds4_gpu_synchronize();
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
@@ -58303,6 +58715,18 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
     return qwen4_gemv_rows(out, m, w, x, n_tok, 0u);
 }
 
+#ifdef DS4_ROCM_BUILD
+static bool qwen4_gemv_pair(ds4_gpu_tensor *a, ds4_gpu_tensor *b, const ds4_model *m,
+        const ds4_tensor *wa, const ds4_tensor *wb, const ds4_gpu_tensor *x, uint32_t T) {
+    ds4_gpu_tensor *outs[2] = {a, b};
+    const uint64_t offs[2] = {wa->abs_offset, wb->abs_offset};
+    const uint32_t types[2] = {wa->type, wb->type};
+    const uint32_t rows[2] = {(uint32_t)wa->dim[1], (uint32_t)wb->dim[1]};
+    return ds4_gpu_qwen4_multi_gemv_tensor(x, T, (uint32_t)wa->dim[0], 2, outs,
+                                         m->map, m->size, offs, types, rows) != 0;
+}
+#endif
+
 /* The MTP draft only needs its argmax, and the tokenizer assigns ids in
  * merge order, so the frequent tokens sit at low ids: DS4_QWEN4_MTP_DRAFT_ROWS
  * scores the draft over that leading prefix of the output head only.  The
@@ -58398,7 +58822,14 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
-    if (T > 8u &&
+    bool projected_up = T > 8u;
+#ifdef DS4_ROCM_BUILD
+    /* The serial HC gate kernel recomputes SiLU for every output channel.
+     * Activate the rank-wide vector once, then use the cooperative dense
+     * projection. Its small F16 path keeps the inputs in float. */
+    if (getenv("DS4_QWEN4_HC_GATE_REFERENCE") == NULL) projected_up = true;
+#endif
+    if (projected_up &&
         up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
@@ -58440,6 +58871,9 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
+#ifdef DS4_ROCM_BUILD
+    if (T <= 8u) paired = qwen4_gemv_pair(g->qkv, g->z, m, l->lin_qkv, l->lin_gate, g->mixed, T);
+#endif
     if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
         paired = ds4_gpu_qwen4_q8_pair_tensor(g->qkv, g->z, m->map, m->size,
@@ -58632,6 +59066,231 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* Build placement after graph allocation: context and prefill scratch are
+ * already charged to the device budget. Dense weights have first priority,
+ * then the predictor, then a contiguous prefix of trunk expert layers. */
+static bool qwen4_graph_configure_placement(ds4_qwen4_gpu_graph *g, ds4_engine *e) {
+    g->cpu_experts = e->cpu_experts;
+#ifdef DS4_ROCM_BUILD
+    if (!e->gpu_memory_budget_bytes) return true;
+    if (!e->qwen4_resident_ready) {
+        const uint32_t trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+        ds4_model_map_span_vec spans = {0};
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (il >= trunk && !e->glm_mtp) continue;
+            model_map_span_vec_include_layer_decode_static(&spans, &e->weights.layer[il]);
+            model_map_span_vec_include_one(&spans, e->weights.layer[il].indexer_k_norm);
+        }
+        model_map_span_vec_include_output(&spans, &e->weights);
+        if (!model_map_span_vec_finish(&spans)) { free(spans.v); return false; }
+        uint64_t dense_bytes = 0;
+        for (uint32_t i = 0; i < spans.len; i++) dense_bytes += spans.v[i].end - spans.v[i].off;
+        if (dense_bytes > ds4_gpu_qwen4_resident_available()) {
+            fprintf(stderr, "ds4: Qwen GPU budget cannot retain %.2f GiB dense weights plus graph/scratch; reduce context or increase budget\n",
+                    (double)dense_bytes / 1073741824.0);
+            free(spans.v); return false;
+        }
+        for (uint32_t i = 0; i < spans.len; i++) {
+            if (!ds4_gpu_qwen4_cache_resident(e->model.map, e->model.size,
+                                             spans.v[i].off, spans.v[i].end - spans.v[i].off)) {
+                free(spans.v); return false;
+            }
+        }
+        free(spans.v);
+        uint64_t expert_bytes = 0;
+        uint32_t gpu_layers = 0;
+        bool mtp_gpu = false;
+        /* Predictor latency lies on the speculative critical path. Fit its
+         * complete expert layer first; otherwise retain CPU execution. */
+        for (uint32_t pass = 0; pass < 2; pass++) {
+            const uint32_t begin = pass == 0 ? trunk : 0;
+            const uint32_t end = pass == 0 ? DS4_N_LAYER : e->gpu_expert_layers;
+            if (pass == 0 && !e->glm_mtp) continue;
+            for (uint32_t il = begin; il < end; il++) {
+                const ds4_layer_weights *l = &e->weights.layer[il];
+                const ds4_tensor *t[3] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+                const uint64_t bytes = t[0]->bytes + t[1]->bytes + t[2]->bytes;
+                if (bytes > ds4_gpu_qwen4_resident_available()) break;
+                for (uint32_t i = 0; i < 3; i++)
+                    if (!ds4_gpu_qwen4_cache_resident(e->model.map, e->model.size, t[i]->abs_offset, t[i]->bytes))
+                        return false;
+                e->qwen4_gpu_expert_mask |= UINT64_C(1) << il;
+                expert_bytes += bytes;
+                if (il < trunk) gpu_layers++; else mtp_gpu = true;
+            }
+        }
+        e->qwen4_resident_ready = true;
+        fprintf(stderr, "ds4: Qwen resident placement: dense %.2f GiB, experts %.2f GiB; trunk GPU %u/%u, remaining CPU; MTP %s; n-grams SSD\n",
+                (double)dense_bytes / 1073741824.0, (double)expert_bytes / 1073741824.0,
+                gpu_layers, trunk, e->glm_mtp ? (mtp_gpu ? "GPU" : "CPU") : "off");
+    }
+    g->gpu_expert_mask = e->qwen4_gpu_expert_mask;
+#endif
+    return true;
+}
+
+#ifdef DS4_ROCM_BUILD
+#ifdef DS4_TEST_HOOKS
+static uint64_t ds4_test_qwen4_cpu_expert_calls;
+#endif
+/* Hash every byte, including Q8 tails, to locate the first differing stage
+ * of identical forwards without changing worker scheduling. Diagnostic only. */
+static uint64_t qwen4_cpu_trace_hash(const void *data, size_t bytes) {
+    const uint8_t *p = data;
+    uint64_t h = UINT64_C(1469598103934665603);
+    /* Byte mixing avoids the high-bit cancellation of word-wise XOR hashes. */
+    while (bytes--) h = (h ^ *p++) * UINT64_C(1099511628211);
+    return h;
+}
+static bool qwen4_graph_cpu_experts(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                      const ds4_layer_weights *l, uint32_t T) {
+#ifdef DS4_TEST_HOOKS
+    ds4_test_qwen4_cpu_expert_calls++;
+#endif
+    const uint64_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NS = DS4_N_EXPERT_USED;
+    if (!g->cpu_expert_x) {
+        const uint64_t xb = (uint64_t)g->cap_tokens * E * sizeof(float);
+        const uint64_t pb = (uint64_t)g->cap_tokens * NS * E * sizeof(float);
+        const uint64_t ib = (uint64_t)g->cap_tokens * NS * sizeof(int);
+        g->cpu_expert_host = ds4_gpu_qwen4_host_alloc(xb + pb + ib);
+        g->cpu_expert_pinned = g->cpu_expert_host != NULL;
+        if (!g->cpu_expert_host) g->cpu_expert_host = xmalloc(xb + pb + ib);
+        g->cpu_expert_x = g->cpu_expert_host;
+        g->cpu_expert_part = (float *)((char *)g->cpu_expert_host + xb);
+        g->cpu_expert_selected = (int *)((char *)g->cpu_expert_host + xb + pb);
+        g->cpu_expert_mid = xmalloc((uint64_t)g->cap_tokens * NS * F * sizeof(float));
+    }
+    if (g->cpu_expert_pinned) {
+        if (!ds4_gpu_qwen4_expert_readback(g->mixed, g->selected, g->cpu_expert_x,
+                g->cpu_expert_selected, T * E * sizeof(float), T * NS * sizeof(int))) return false;
+    } else if (!ds4_gpu_tensor_read(g->mixed, 0, g->cpu_expert_x, T * E * sizeof(float)) ||
+               !ds4_gpu_tensor_read(g->selected, 0, g->cpu_expert_selected, T * NS * sizeof(int))) return false;
+    for (uint64_t i = 0; i < T * NS; i++)
+        if (g->cpu_expert_selected[i] < 0 || (uint32_t)g->cpu_expert_selected[i] >= DS4_N_EXPERT) return false;
+    /* Queue shared-expert work before the host projections. The subsequent
+     * upload/reduction orders both branches without moving routed weights. */
+    if (!qwen4_gemv_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp, g->mixed, T) ||
+        !ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * F, 0.0f, 1.0f) ||
+        !qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T)) return false;
+    qwen4_cpu_expert_job job = {.model = m, .layer = l, .x = g->cpu_expert_x,
+        .selected = g->cpu_expert_selected, .mid = g->cpu_expert_mid, .part = g->cpu_expert_part,
+        .fuse_gate_up = getenv("DS4_QWEN4_CPU_SEPARATE_GATE_UP") == NULL};
+    uint32_t n_jobs = T * NS;
+#if defined(__AVX2__)
+    if (T > 0u && l->ffn_gate_exps->type == DS4_TENSOR_IQ3_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ3_XXS && l->ffn_down_exps->type == DS4_TENSOR_IQ3_XXS) {
+        if (!g->cpu_expert_groups)
+            g->cpu_expert_groups = xmalloc((uint64_t)g->cap_tokens * NS * sizeof(*g->cpu_expert_groups));
+        int tail[DS4_N_EXPERT];
+        for (uint32_t i = 0; i < DS4_N_EXPERT; i++) tail[i] = -1;
+        uint32_t groups = 0;
+        for (uint32_t slot = 0; slot < T * NS; slot++) {
+            const uint32_t expert = g->cpu_expert_selected[slot];
+            if (tail[expert] < 0 || g->cpu_expert_groups[tail[expert]].count == 4u) {
+                tail[expert] = (int)groups++;
+                g->cpu_expert_groups[tail[expert]].expert = expert;
+                g->cpu_expert_groups[tail[expert]].count = 0;
+            }
+            qwen4_cpu_expert_group *group = &g->cpu_expert_groups[tail[expert]];
+            group->slots[group->count++] = slot;
+        }
+        /* Opt-in during numerical and end-to-end quality assessment. */
+        if (getenv("DS4_QWEN4_CPU_Q8")) {
+            if (!g->cpu_expert_xq) {
+                g->cpu_expert_xq = xmalloc((uint64_t)g->cap_tokens * ((E + 255) / 256) * sizeof(block_q8_K));
+                g->cpu_expert_midq = xmalloc((uint64_t)g->cap_tokens * NS * ((F + 255) / 256) * sizeof(block_q8_K));
+            }
+            for (uint32_t t = 0; t < T; t++) qwen4_quantize_q8(E, job.x + (uint64_t)t * E, g->cpu_expert_xq + (uint64_t)t * ((E + 255) / 256));
+            job.xq = g->cpu_expert_xq;
+            job.midq = g->cpu_expert_midq;
+        }
+        job.groups = g->cpu_expert_groups;
+        n_jobs = groups;
+    }
+#endif
+    /* The existing host worker pool has one job at a time. Serialize CPU
+     * expert jobs across sessions while preserving independent graph state. */
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mutex);
+    if (job.groups && getenv("DS4_QWEN4_CPU_STATIC") == NULL) {
+        job.rows = n_jobs * F;
+        job.projection = qwen4_cpu_expert_mid;
+        ds4_parallel_for(job.rows, qwen4_cpu_expert_work, &job);
+#if defined(__AVX2__)
+        if (job.midq) for (uint32_t slot = 0; slot < T * NS; slot++)
+            qwen4_quantize_q8(F, job.mid + (uint64_t)slot * F, g->cpu_expert_midq + (uint64_t)slot * ((F + 255) / 256));
+#endif
+        job.next_row = 0;
+        job.rows = n_jobs * E;
+        job.projection = qwen4_cpu_expert_down;
+        ds4_parallel_for(job.rows, qwen4_cpu_expert_work, &job);
+    } else {
+        ds4_parallel_for(n_jobs * F, qwen4_cpu_expert_mid, &job);
+#if defined(__AVX2__)
+        if (job.midq) for (uint32_t slot = 0; slot < T * NS; slot++)
+            qwen4_quantize_q8(F, job.mid + (uint64_t)slot * F, g->cpu_expert_midq + (uint64_t)slot * ((F + 255) / 256));
+#endif
+        ds4_parallel_for(n_jobs * E, qwen4_cpu_expert_down, &job);
+    }
+    pthread_mutex_unlock(&mutex);
+    const char *trace_path = getenv("DS4_QWEN4_CPU_TRACE");
+    if (trace_path) {
+        FILE *trace = fopen(trace_path, "a");
+        if (!trace) return false;
+        fprintf(trace, "%llu,%u,%u,%u,%016llx,%016llx,%016llx,%016llx,%016llx,%016llx\n",
+            (unsigned long long)g->cpu_trace_sequence, g->pos, T,
+            (uint32_t)(l - g->layer_weights),
+            (unsigned long long)qwen4_cpu_trace_hash(job.x, T * E * sizeof(float)),
+            (unsigned long long)qwen4_cpu_trace_hash(job.selected, T * NS * sizeof(int)),
+            (unsigned long long)(job.xq ? qwen4_cpu_trace_hash(job.xq, T * ((E + 255) / 256) * sizeof(block_q8_K)) : 0),
+            (unsigned long long)qwen4_cpu_trace_hash(job.mid, T * NS * F * sizeof(float)),
+            (unsigned long long)(job.midq ? qwen4_cpu_trace_hash(job.midq, T * NS * ((F + 255) / 256) * sizeof(block_q8_K)) : 0),
+            (unsigned long long)qwen4_cpu_trace_hash(job.part, T * NS * E * sizeof(float)));
+        fclose(trace);
+#if defined(__AVX2__)
+        if (job.midq && getenv("DS4_QWEN4_CPU_VERIFY")) {
+            float *check = xmalloc(T * NS * E * sizeof(float));
+            qwen4_cpu_expert_job serial = job;
+            serial.part = check;
+            qwen4_cpu_expert_down(&serial, 0, n_jobs * E);
+            uint64_t differences = 0;
+            for (uint64_t i = 0; i < T * NS * E; i++)
+                if (memcmp(check + i, job.part + i, sizeof(float))) {
+                    if (!differences) fprintf(stderr, "Q8 check seq=%llu row=%llu parallel=%a serial=%a mxcsr=%x workers_round=%x\n",
+                        (unsigned long long)g->cpu_trace_sequence, (unsigned long long)i,
+                        (double)job.part[i], (double)check[i], _mm_getcsr(), job.trace_mxcsr);
+                    differences++;
+                }
+            if (differences) fprintf(stderr, "Q8 check seq=%llu differing=%llu mxcsr=%x workers_round=%x\n",
+                (unsigned long long)g->cpu_trace_sequence, (unsigned long long)differences, _mm_getcsr(), job.trace_mxcsr);
+            if (differences) {
+                char dump_path[4096];
+                snprintf(dump_path, sizeof(dump_path), "%s-%llu-%u-%u.bin", trace_path,
+                    (unsigned long long)g->cpu_trace_sequence, g->pos, (uint32_t)(l - g->layer_weights));
+                FILE *dump = fopen(dump_path, "wb");
+                if (dump) {
+                    fwrite(&T, sizeof(T), 1, dump); fwrite(&n_jobs, sizeof(n_jobs), 1, dump);
+                    fwrite(job.groups, sizeof(*job.groups), n_jobs, dump);
+                    fwrite(job.midq, sizeof(block_q8_K), T * NS * ((F + 255) / 256), dump);
+                    fwrite(job.part, sizeof(float), T * NS * E, dump);
+                    fwrite(check, sizeof(float), T * NS * E, dump);
+                    fclose(dump);
+                }
+            }
+            free(check);
+        }
+#endif
+    }
+    for (uint64_t i = 0; i < T * NS * E; i++) if (!isfinite(g->cpu_expert_part[i])) return false;
+    const bool uploaded = g->cpu_expert_pinned
+        ? ds4_gpu_qwen4_expert_upload(g->part, g->cpu_expert_part, T * NS * E * sizeof(float))
+        : ds4_gpu_tensor_write(g->part, 0, g->cpu_expert_part, T * NS * E * sizeof(float));
+    return uploaded &&
+        ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
+                                         g->sh_out, g->R, g->inj, T, NS, NS, E, DS4_N_HC);
+}
+#endif
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
@@ -58641,6 +59300,11 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+#ifdef DS4_ROCM_BUILD
+    const uint32_t layer = (uint32_t)(l - g->layer_weights);
+    if (g->cpu_experts && !(g->gpu_expert_mask & (UINT64_C(1) << layer)))
+        return ok && qwen4_graph_cpu_experts(g, m, l, T);
+#endif
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -64690,7 +65354,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) ||
+        ds4_session_is_qwen4(s) || ds4_session_is_ds41(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -65169,7 +65834,9 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        /* CPU expert placement is session-owned. Use the same graph session
+         * as chat instead of the standalone GPU-only greedy helper. */
+        if (e->cpu_experts || e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -67833,6 +68500,34 @@ static void qwen4_dump_f32(const char *path, const float *v, uint64_t n) {
     fclose(f);
 }
 
+#ifdef DS4_HAS_QWEN4_GPU
+/* Compact diagnostic exports retain per-token probabilities without writing
+ * an entire vocabulary for every corpus token. Never used by generation. */
+static bool qwen4_write_token_scores(FILE *file, const float *logits,
+                                    const int *tokens, uint32_t prompt_n,
+                                    uint32_t rows, bool teacher) {
+    const uint32_t n = teacher ? rows : rows - 1u;
+    if (fprintf(file, "position,token,logprob,top1\n") < 0) return false;
+    for (uint32_t t = 0; t < n; t++) {
+        const uint32_t pos = teacher ? prompt_n + t : t + 1u;
+        const int token = tokens[pos];
+        if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+        const float *row = logits + (uint64_t)t * DS4_N_VOCAB;
+        float maximum = -INFINITY;
+        uint32_t top = 0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+            if (!isfinite(row[i])) return false;
+            if (row[i] > maximum) { maximum = row[i]; top = i; }
+        }
+        double sum = 0.0;
+        for (uint32_t i = 0; i < DS4_N_VOCAB; i++) sum += exp((double)row[i] - maximum);
+        const double logprob = (double)row[token] - maximum - log(sum);
+        if (!isfinite(logprob) || fprintf(file, "%u,%d,%.17g,%u\n", pos, token, logprob, top) < 0) return false;
+    }
+    return !ferror(file);
+}
+#endif
+
 /* --first-token-test for Qwen3.8: DS4_QWEN4_FT_TOKENS (comma-separated ids,
  * default: the prompt) runs the sequential CPU reference; DS4_QWEN4_FT_OUT
  * dumps [n][vocab] f32 logits, DS4_QWEN4_FT_HIDDEN [n][trunk][hc*embd]
@@ -67840,7 +68535,8 @@ static void qwen4_dump_f32(const char *path, const float *v, uint64_t n) {
  * DS4_QWEN4_MTP_BATCH_CHECK also compares sequential and paired GPU drafts
  * (requires MTP_OUT, GPU=1, and GPU_CHUNK >= 2). */
 static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab,
-                                  const ds4_weights *weights, const ds4_tokens *prompt, bool metal) {
+                                  const ds4_weights *weights, const ds4_tokens *prompt, bool metal, ds4_engine *engine) {
+    (void)engine; /* CPU-only builds reject hybrid placement during engine open. */
     /* DS4_QWEN4_FT_LIST=<file>: batch mode.  Each line is
      * "<comma ids>\t<out path>"; every sequence runs through the Metal graph
      * (prefill all-rows logits, the production kernel path) and its
@@ -67852,6 +68548,17 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         if (!metal || !getenv("DS4_QWEN4_GPU")) {
             fprintf(stderr, "ds4: DS4_QWEN4_FT_LIST needs a GPU backend with DS4_QWEN4_GPU set\n");
             return 1;
+        }
+        uint32_t teacher_batch = 1u;
+        const char *batch_env = getenv("DS4_QWEN4_FT_TEACHER_BATCH");
+        if (batch_env) {
+            char *end = NULL;
+            const unsigned long value = strtoul(batch_env, &end, 10);
+            if (!batch_env[0] || *end || value < 1u || value > 8u) {
+                fprintf(stderr, "ds4: FT_TEACHER_BATCH must be between 1 and 8\n");
+                return 1;
+            }
+            teacher_batch = (uint32_t)value;
         }
         FILE *lf = fopen(ft_list, "r");
         if (!lf) {
@@ -67877,6 +68584,9 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         if (!g->logits) {
             qwen4_graph_free(g); free(g); fclose(lf);
             return 1;
+        }
+        if (!qwen4_graph_configure_placement(g, engine)) {
+            qwen4_graph_free(g); free(g); fclose(lf); return 1;
         }
         char *line = xmalloc(65536);
         int *lseq = xmalloc(4096 * sizeof(int));
@@ -67932,9 +68642,12 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
                     prefix_len = p_len;
                 }
             }
-            for (uint32_t t = 0; bar && t + 1u < ln && fok; t++) {
-                fok = qwen4_graph_forward_tokens(g, model, weights, lseq + p_len + t, 1u,
-                                                 out + (uint64_t)(t + 1u) * DS4_N_VOCAB, false);
+            for (uint32_t t = 0; bar && t + 1u < ln && fok;) {
+                const uint32_t remaining = ln - t - 1u;
+                const uint32_t n = remaining < teacher_batch ? remaining : teacher_batch;
+                fok = qwen4_graph_forward_tokens(g, model, weights, lseq + p_len + t, n,
+                                                 out + (uint64_t)(t + 1u) * DS4_N_VOCAB, n > 1u);
+                t += n;
             }
             if (!fok) {
                 fprintf(stderr, "ds4: FT_LIST forward failed (%u tokens)\n", ln);
@@ -67943,7 +68656,10 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
                 return 1;
             }
             FILE *of = fopen(out_path, "wb");
-            if (!of || fwrite(out, sizeof(float), (size_t)ln * DS4_N_VOCAB, of) != (size_t)ln * DS4_N_VOCAB) {
+            const bool wrote = of && (getenv("DS4_QWEN4_FT_SCORES")
+                ? qwen4_write_token_scores(of, out, lseq, p_len, ln, bar != NULL)
+                : fwrite(out, sizeof(float), (size_t)ln * DS4_N_VOCAB, of) == (size_t)ln * DS4_N_VOCAB);
+            if (!wrote) {
                 fprintf(stderr, "ds4: FT_LIST write failed: %s\n", out_path);
                 if (of) fclose(of);
                 free(prefix_logits); free(out); free(lseq); free(line);
@@ -68029,6 +68745,9 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
         if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
             free(g);
             return 1;
+        }
+        if (!qwen4_graph_configure_placement(g, engine)) {
+            qwen4_graph_free(g); free(g); return 1;
         }
         qwen4_graph_reset(g);
         float *gpu = xmalloc((uint64_t)V * sizeof(float));
@@ -68179,7 +68898,7 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     const ds4_weights *weights = &e->weights;
 
     if (ds4_model_is_qwen4()) {
-        return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend));
+        return qwen4_first_token_test(model, vocab, weights, prompt, ds4_backend_uses_graph(e->backend), e);
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -70615,6 +71334,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->vision_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->cpu_experts = opt->cpu_experts || opt->gpu_memory_budget_bytes || opt->gpu_expert_layers_set;
+    e->gpu_memory_budget_bytes = opt->gpu_memory_budget_bytes;
+    if (opt->gpu_expert_layers_set && !e->gpu_memory_budget_bytes)
+        e->gpu_memory_budget_bytes = 12ull * 1073741824ull;
+    e->gpu_expert_layers = opt->gpu_expert_layers_set ? opt->gpu_expert_layers :
+                          (opt->cpu_experts ? 0u : UINT32_MAX);
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
@@ -70742,6 +71467,31 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (e->cpu_experts) {
+#ifdef DS4_ROCM_BUILD
+        const bool supported = ds4_model_is_qwen4() && e->backend == DS4_BACKEND_CUDA;
+#else
+        const bool supported = false;
+#endif
+        if (!supported) {
+            fprintf(stderr, "ds4: --cpu-experts requires Qwen3.8 with the ROCm backend\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        const uint32_t trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+        if (DS4_N_LAYER > 64u || (opt->gpu_expert_layers_set && e->gpu_expert_layers > trunk)) {
+            fprintf(stderr, "ds4: --gpu-expert-layers must be between 0 and %u\n", trunk);
+            ds4_engine_close(e); *out = NULL; return 1;
+        }
+        if (e->gpu_expert_layers == UINT32_MAX) e->gpu_expert_layers = trunk;
+        if (e->gpu_memory_budget_bytes && !e->prefill_chunk) e->prefill_chunk = 128u;
+        ds4_threads_init();
+        if (e->gpu_memory_budget_bytes)
+            fprintf(stderr, "ds4: hybrid Qwen: %u CPU workers; resident GPU placement fitted after graph allocation; n-grams on SSD\n", g_pool.n_threads);
+        else
+            fprintf(stderr, "ds4: hybrid Qwen: routed experts on CPU (%u threads), dense/shared graph on GPU; n-grams on SSD\n", g_pool.n_threads);
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -71005,6 +71755,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                              &e->model,
                                                              NULL, NULL, 0);
                 }
+#ifdef DS4_ROCM_BUILD
+                if (ready && e->gpu_memory_budget_bytes)
+                    ready = ds4_gpu_qwen4_set_memory_budget(e->gpu_memory_budget_bytes);
+#endif
                 if (!ready) {
                     fprintf(stderr, "ds4: Qwen3.8 test model map setup failed\n");
                     ds4_engine_close(e);
@@ -71782,6 +72536,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#ifdef DS4_ROCM_BUILD
+        if (e->gpu_memory_budget_bytes && !ds4_gpu_qwen4_set_memory_budget(e->gpu_memory_budget_bytes)) {
+            fprintf(stderr, "ds4: unable to admit Qwen GPU memory budget\n");
+            free(load_offsets); free(load_sizes);
+            ds4_engine_close(e); *out = NULL; return 1;
+        }
+#endif
         if (tp_shard && e->backend == DS4_BACKEND_METAL) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
@@ -73104,6 +73865,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             qwen4_graph_free(&s->qwen4_graph);
             free(s);
             return 1;
+        }
+        if (!qwen4_graph_configure_placement(&s->qwen4_graph, e)) {
+            if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
+            qwen4_graph_free(&s->qwen4_graph); free(s); return 1;
         }
         s->qwen4_graph_ready = true;
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;

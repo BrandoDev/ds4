@@ -285,6 +285,50 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f16_transpose_range> g_q8_f16_transpose_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
+/* Qwen retains byte-identical tensor copies separately from the temporary
+ * per-layer cache. Full model teardown owns these copies; layer release does
+ * not. The budget counts total device usage, including the desktop/other jobs. */
+typedef struct {
+    const void *map;
+    uint64_t offset, bytes;
+    char *ptr;
+} qwen4_resident_range;
+static qwen4_resident_range g_qwen4_resident[2048];
+static uint32_t g_qwen4_resident_count;
+static uint64_t g_qwen4_memory_budget;
+static char g_qwen4_vram_used_path[160];
+
+static int qwen4_memory_info(size_t *free_bytes, size_t *total) {
+    if (cudaMemGetInfo(free_bytes, total) != cudaSuccess) return 0;
+    /* HIP's free counter can omit device allocations visible to amdgpu.
+     * Admission must use the larger usage for this same PCI device. */
+    if (g_qwen4_vram_used_path[0]) {
+        FILE *fp = fopen(g_qwen4_vram_used_path, "r");
+        unsigned long long used = 0;
+        const int ok = fp && fscanf(fp, "%llu", &used) == 1;
+        if (fp) fclose(fp);
+        if (!ok) return 0;
+        const size_t available = used < *total ? *total - (size_t)used : 0;
+        if (available < *free_bytes) *free_bytes = available;
+    }
+    return 1;
+}
+
+static int qwen4_memory_fits(uint64_t bytes) {
+    if (!g_qwen4_memory_budget) return 1;
+    size_t free_bytes = 0, total = 0;
+    if (!qwen4_memory_info(&free_bytes, &total)) return 0;
+    const uint64_t used = total - free_bytes;
+    return used <= g_qwen4_memory_budget && bytes <= g_qwen4_memory_budget - used;
+}
+
+static void qwen4_resident_release(void) {
+    for (uint32_t i = 0; i < g_qwen4_resident_count; i++)
+        (void)cudaFree(g_qwen4_resident[i].ptr);
+    g_qwen4_resident_count = 0;
+    g_qwen4_memory_budget = 0;
+    g_qwen4_vram_used_path[0] = 0;
+}
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_disabled_for_multi_model;
@@ -590,6 +634,11 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
         g_cuda_tmp_bytes = 0;
     }
     void *ptr = NULL;
+    if (!qwen4_memory_fits(bytes)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "Qwen GPU budget cannot fit %s scratch (%.2f MiB)\n",
+                what, (double)bytes / 1048576.0);
+        return NULL;
+    }
     cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "temp alloc failed for %s (%.2f MiB): %s\n",
@@ -629,6 +678,12 @@ static const char *cuda_model_image_range_ptr(
         uint64_t    offset,
         uint64_t    bytes) {
     if (bytes == 0) return cuda_model_image_ptr(model_map, offset);
+    for (uint32_t i = 0; i < g_qwen4_resident_count; i++) {
+        const qwen4_resident_range *r = &g_qwen4_resident[i];
+        if (r->map == model_map && offset >= r->offset &&
+            offset - r->offset <= r->bytes && bytes <= r->bytes - (offset - r->offset))
+            return r->ptr + (offset - r->offset);
+    }
     for (const cuda_model_image &img : g_model_images) {
         if (img.host_base != model_map || offset < img.device_offset) continue;
         const uint64_t rel = offset - img.device_offset;
@@ -4643,6 +4698,11 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
 
     cudaError_t err = cudaSuccess;
+    if (!qwen4_memory_fits(bytes)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "Qwen GPU budget cannot fit temporary weights for %s (%.2f MiB)\n",
+                what ? what : "weights", (double)bytes / 1048576.0);
+        return NULL;
+    }
     if (g_model_range_mapping_supported && model_map == g_model_host_base) {
         const long page_sz_l = sysconf(_SC_PAGESIZE);
         const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -5805,6 +5865,7 @@ static void cuda_model_range_release_ranges_only(void) {
 
 static void cuda_model_range_release_all(void) {
     cuda_model_range_release_ranges_only();
+    qwen4_resident_release();
     g_stream_selected_cache.loaded = 0;
     cuda_stream_resident_cache_release();
     cuda_model_load_progress_reset();
@@ -5957,6 +6018,11 @@ __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
+    if (!qwen4_memory_fits(bytes)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "Qwen GPU budget cannot fit graph tensor (%.2f MiB); reduce context or prefill chunk\n",
+                (double)bytes / 1048576.0);
+        return NULL;
+    }
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
@@ -6058,6 +6124,39 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+}
+
+extern "C" void *ds4_gpu_qwen4_host_alloc(uint64_t bytes) {
+    void *ptr = NULL;
+    if (!bytes || bytes > SIZE_MAX || getenv("DS4_QWEN4_PAGEABLE_STAGING")) return NULL;
+    if (cudaMallocHost(&ptr, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL; /* caller retains the synchronous pageable path */
+    }
+    return ptr;
+}
+
+extern "C" void ds4_gpu_qwen4_host_free(void *ptr) {
+    if (!ptr) return;
+    /* An early graph error can leave the last expert upload in flight. */
+    (void)cudaStreamSynchronize(0);
+    (void)cudaFreeHost(ptr);
+}
+
+extern "C" int ds4_gpu_qwen4_expert_readback(const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+        void *host_x, void *host_ids, uint64_t x_bytes, uint64_t ids_bytes) {
+    if (!x || !ids || !host_x || !host_ids || x_bytes > x->bytes || ids_bytes > ids->bytes) return 0;
+    /* The one stream wait makes both inputs visible and completes the
+     * preceding layer's upload before its pinned output buffer is reused. */
+    return cuda_ok(cudaMemcpyAsync(host_x, x->ptr, (size_t)x_bytes, cudaMemcpyDeviceToHost, 0), "Qwen expert input") &&
+           cuda_ok(cudaMemcpyAsync(host_ids, ids->ptr, (size_t)ids_bytes, cudaMemcpyDeviceToHost, 0), "Qwen expert IDs") &&
+           cuda_ok(cudaStreamSynchronize(0), "Qwen expert readback");
+}
+
+extern "C" int ds4_gpu_qwen4_expert_upload(ds4_gpu_tensor *out, const void *host, uint64_t bytes) {
+    if (!out || !host || bytes > out->bytes) return 0;
+    /* The GPU reducer and next readback are ordered on the default stream. */
+    return cuda_ok(cudaMemcpyAsync(out->ptr, host, (size_t)bytes, cudaMemcpyHostToDevice, 0), "Qwen expert upload");
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

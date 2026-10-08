@@ -159,6 +159,26 @@ implemented for this model yet.
 ROCm supports the text graph and IQ3_XXS routed experts, with short-prompt
 CPU/GPU parity and generation validated on the RX 9070 XT. Weights are copied
 to VRAM per layer; vision and SSD selected-expert caching remain unsupported.
+For mixed CPU/GPU inference on ROCm, add `--cpu-experts` to `ds4` or
+`ds4-server`. All selected routed MoE experts run on CPU using the existing
+host worker pool; attention, Gated DeltaNet, routing, shared experts and
+residual reduction stay on GPU. The original BF16 n-grams remain disk-only.
+This applies to both prompt prefill and token decoding. Routed weights stay
+in the file-backed host mapping; the graph transfers activations and expert
+outputs instead of routed weights. Dense GPU weights still transfer per
+layer; this is not a persistent GPU weight cache.
+
+```sh
+./ds4-server --rocm --cpu-experts -m gguf/Qwen3.8-Flash-Next-IQ3.gguf \
+  --ctx 2048 --prefill-chunk 128 --threads 8 --host 127.0.0.1 --port 8000
+```
+
+For a fast direct-answer chat test, send `temperature: 0` and
+`chat_template_kwargs: {"enable_thinking": false}`. Omit `--vision` and
+`--mtp`. Choose the prefill chunk explicitly: host expert buffers scale
+with its size, as do GPU transients. CPU placement is currently supported
+only for Qwen on ROCm; other models and backends reject the option.
+
 See [ROCm validation and limits](QWEN38_ROCM_RDNA4.md). IQ3_XXS is not supported
 by the Metal/CUDA graphs. CPU code is a correctness reference, not a general
 inference backend.

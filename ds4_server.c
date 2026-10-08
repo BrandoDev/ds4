@@ -15726,6 +15726,16 @@ static server_config parse_options(int argc, char **argv) {
                            "ds4-server: --simulate-used-memory must be a positive GiB value, e.g. 64GB");
                 exit(2);
             }
+        } else if (!strcmp(arg, "--cpu-experts")) {
+            c.engine.cpu_experts = true;
+        } else if (!strcmp(arg, "--gpu-memory-budget")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg), &c.engine.gpu_memory_budget_bytes)) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --gpu-memory-budget requires a positive GiB value");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--gpu-expert-layers")) {
+            c.engine.gpu_expert_layers = (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.gpu_expert_layers_set = true;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

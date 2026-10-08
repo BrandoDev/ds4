@@ -36,6 +36,57 @@ __global__ static void qwen4_rocm_router_kernel(
     for (uint32_t s = 0; s < NS; s++) weights[(uint64_t)t * NS + s] /= chosen_total;
 }
 
+/* Shared probabilities avoid the private 512-float spill. A wave selects
+ * top-k with the same smallest-ID tie break. Keep the softmax denominator
+ * and selected-weight sum in expert/slot order to preserve their rounding. */
+__global__ static void qwen4_rocm_router_wave_kernel(
+        int *selected, float *weights, const float *logits, const float *x,
+        const char *gate, float *shared_gate, uint32_t NE, uint32_t NS,
+        uint32_t K, uint32_t gate_type) {
+    const uint32_t t = blockIdx.x, lane = threadIdx.x;
+    __shared__ float p[512], total;
+    float mx = -FLT_MAX;
+    for (uint32_t e = lane; e < NE; e += 32u) mx = fmaxf(mx, logits[(uint64_t)t * NE + e]);
+    for (uint32_t d = 16u; d; d >>= 1u) mx = fmaxf(mx, __shfl_xor(mx, d, 32));
+    for (uint32_t e = lane; e < NE; e += 32u) p[e] = expf(logits[(uint64_t)t * NE + e] - mx);
+    __syncthreads();
+    if (!lane) {
+        float sum = 0.0f;
+        for (uint32_t e = 0; e < NE; e++) sum += p[e];
+        total = sum;
+    }
+    __syncthreads();
+    for (uint32_t e = lane; e < NE; e += 32u) p[e] /= total;
+    if (K) {
+        float v = 0.0f;
+        for (uint32_t i = lane; i < K; i += 32u)
+            v += qwen4_rocm_weight_at(gate, gate_type, i) * x[(uint64_t)t * K + i];
+        v = qwen4_rocm_wave32_sum_xor(v);
+        if (!lane) shared_gate[t] = v;
+    }
+    __syncthreads();
+    float chosen_total = 0.0f;
+    for (uint32_t s = 0; s < NS; s++) {
+        float best = -1.0f;
+        uint32_t id = NE;
+        for (uint32_t e = lane; e < NE; e += 32u)
+            if (p[e] > best) { best = p[e]; id = e; }
+        for (uint32_t d = 16u; d; d >>= 1u) {
+            const float other = __shfl_xor(best, d, 32);
+            const uint32_t oi = __shfl_xor(id, d, 32);
+            if (other > best || (other == best && oi < id)) { best = other; id = oi; }
+        }
+        if (!lane) {
+            selected[(uint64_t)t * NS + s] = (int)id;
+            weights[(uint64_t)t * NS + s] = best;
+            chosen_total += best;
+            p[id] = -1.0f;
+        }
+        __syncthreads();
+    }
+    if (!lane) for (uint32_t s = 0; s < NS; s++) weights[(uint64_t)t * NS + s] /= chosen_total;
+}
+
 extern "C" int ds4_gpu_qwen4_router_topk_tensor(
         ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *x, const void *map, uint64_t size, uint64_t gate_offset,
@@ -52,7 +103,12 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(
               gate_offset > size || rb > size - gate_offset)) return 0;
     const char *w = K ? cuda_model_range_ptr(map, gate_offset, rb, "Qwen shared gate") : NULL;
     if (K && !w) return 0;
-    qwen4_rocm_router_kernel<<<T, 1>>>(
+    if (getenv("DS4_QWEN4_SERIAL_ROUTER")) {
+        qwen4_rocm_router_kernel<<<T, 1>>>(
+            (int *)selected->ptr, (float *)weights->ptr, (const float *)logits->ptr,
+            K ? (const float *)x->ptr : NULL, w,
+            K ? (float *)shared_gate->ptr : NULL, NE, NS, K, gate_type);
+    } else qwen4_rocm_router_wave_kernel<<<T, 32>>>(
         (int *)selected->ptr, (float *)weights->ptr, (const float *)logits->ptr,
         K ? (const float *)x->ptr : NULL, w,
         K ? (float *)shared_gate->ptr : NULL, NE, NS, K, gate_type);
